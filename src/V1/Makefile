@@ -7,6 +7,7 @@ CC = gcc
 # the code.  If you are having problems running the code, you might 
 # want to comment this line to see if an assert() statement fires.
 FLAG1 = -DNDEBUG
+FLAG2 = -pg
 
 ######################################################################
 # -DKLT_USE_QSORT forces the code to use the standard qsort() 
