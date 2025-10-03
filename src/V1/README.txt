@@ -1,35 +1,56 @@
-**********************************************************************
-NOTICE:
+# V1 – KLT Feature Tracker
 
-This code is now in the public domain.  The Stanford Office of 
-Technology Licensing has removed all licensing restrictions.
+This version implements the **Kanade–Lucas–Tomasi (KLT) feature tracker**, a computer vision algorithm used to detect and track features in images across frames.
+It builds a static library "libklt.a" and several example programs `example1`–`example5` demonstrating feature detection, tracking, and visualization.
 
-**********************************************************************
+---
 
-KLT
-An implementation of the Kanade-Lucas-Tomasi feature tracker
+## Project Structure
 
-Version 1.3.4
+* `*.c` and `*.h`: Core source files implementing KLT (e.g., `trackFeatures.c`, `selectGoodFeatures.c`, etc.)
+* `libklt.a`: Static library built from the source files
+* `example1.c` … `example5.c`: Example programs showing how to use the KLT tracker
+* `Makefile`: Build automation
 
-Authors: Stan Birchfield
-         stb@clemson.edu	
+---
 
-         Thorsten Thormaehlen
-         thormae@tnt.uni-hannover.de
-         (implemented affine code)
+## Build Instructions
 
-         Thanks to many others for various bug fixes.
- 
-Date: August   30, A.D. 2007
-      May      10, A.D. 2007
-      March    28, A.D. 2006
-      November 21, A.D. 2005
-      August   17, A.D. 2005
-      June     16, A.D. 2004
-      October   7, A.D. 1998
+### Prerequisites
 
-The code can be obtained from http://www.ces.clemson.edu/~stb/klt
-(alternatively http://www.vision.stanford.edu/~birch/klt),
-where the official manuals reside.  For your convenience, unofficial 
-manuals have been placed in the current subdirectory 'doc'.
+* GCC (GNU Compiler Collection)
+* Standard C libraries
+
+### Compile Everything
+
+```bash
+make all
+```
+
+This will:
+
+* Build the static library `libklt.a`
+* Compile all five example executables (`example1` … `example5`)
+
+### Clean Build Files
+
+```bash
+make clean
+```
+
+---
+
+## Running Examples
+
+Each example can be executed directly after building. For example:
+
+```bash
+./example1
+```
+
+## Notes
+
+* `-DNDEBUG` disables debugging assertions. Remove it from the `Makefile` if you want debug mode.
+* Profiling is enabled with `-pg`. Use `gprof` to analyze performance after running examples.
+* If you encounter issues with sorting performance, you can uncomment `-DKLT_USE_QSORT` in the `Makefile` to force use of the standard C `qsort()`.
 
