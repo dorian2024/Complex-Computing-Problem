@@ -184,22 +184,39 @@ static void _convolveImageHoriz(
 }
 
 
+
 /*********************************************************************
  * _convolveImageVert
  */
 
 static void _convolveImageVert(
-  _KLT_FloatImage imgin,
-  ConvolutionKernel kernel,
-  _KLT_FloatImage imgout)
+  _KLT_FloatImage imgin,     //input image float pixels
+  ConvolutionKernel kernel,   //convolution kernel (1D Vertical filter)
+  _KLT_FloatImage imgout)   // output image result of convulation
 {
+
+
+
   float *ptrcol = imgin->data;            /* Points to row's first pixel */
   register float *ptrout = imgout->data,  /* Points to next output pixel */
     *ppp;
+    
+    
+    
+    //temporary variables for computation
   register float sum;
-  register int radius = kernel.width / 2;
-  register int ncols = imgin->ncols, nrows = imgin->nrows;
+  register int radius = kernel.width / 2;    //half width of the kernel
+  register int ncols = imgin->ncols;  //no of cols in the image
+  register int nrows = imgin->nrows;   //number of rows in the image
   register int i, j, k;
+
+
+
+
+
+////////        validation checks 
+
+
 
   /* Kernel width must be odd */
   assert(kernel.width % 2 == 1);
@@ -210,38 +227,68 @@ static void _convolveImageVert(
   /* Output image must be large enough to hold result */
   assert(imgout->ncols >= imgin->ncols);
   assert(imgout->nrows >= imgin->nrows);
+  
+  
+////////        main convolution loop 
+  
 
   /* For each column, do ... */
   for (i = 0 ; i < ncols ; i++)  {
 
     /* Zero topmost rows */
-    for (j = 0 ; j < radius ; j++)  {
-      *ptrout = 0.0;
-      ptrout += ncols;
+    //zeroin out the top radius rows because convultion windows
+//extends above the image boundary 
+    for (j = 0 ; j < radius ; j++) 
+     {
+      *ptrout = 0.0;      //top edge pixels are set to 0 
+      ptrout += ncols;      //moving one row down next pixel in the same row 
     }
 
     /* Convolve middle rows with kernel */
-    for ( ; j < nrows - radius ; j++)  {
+    //these are for each row where the kernel fits exactly 
+//inside the image 
+    
+    for ( ; j < nrows - radius ; j++) 
+     {
+     
+     //start pointer points to the top of the kernel window
       ppp = ptrcol + ncols * (j - radius);
+      
+      
       sum = 0.0;
-      for (k = kernel.width-1 ; k >= 0 ; k--)  {
+      
+//multiplying kernel coefficients with the corresponding pixel values
+      
+      for (k = kernel.width-1 ; k >= 0 ; k--) 
+      {
         sum += *ppp * kernel.data[k];
-        ppp += ncols;
+        ppp += ncols;    //next row in colum
       }
+      
+      
+      
+      //storinng the concultioon result in the output image
       *ptrout = sum;
       ptrout += ncols;
     }
 
     /* Zero bottommost rows */
-    for ( ; j < nrows ; j++)  {
+    
+    //the convolution extends around the image boundary so we add zeros
+    for ( ; j < nrows ; j++)  
+    {
       *ptrout = 0.0;
       ptrout += ncols;
     }
 
+
+//moving to the next column 
     ptrcol++;
+    //repositionign the output pointer to the staet of the next column
     ptrout -= nrows * ncols - 1;
   }
 }
+
 
 
 /*********************************************************************
