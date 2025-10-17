@@ -13,8 +13,17 @@
 #include "convolve.h"
 #include "klt_util.h"   /* printing */
 
-#define MAX_KERNEL_WIDTH 	71
+#define cudaCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+    if (code != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
 
+
+#define MAX_KERNEL_WIDTH 	71
 
 typedef struct  {
   int width;
@@ -129,218 +138,274 @@ void _KLTGetKernelWidths(
   *gaussderiv_width = gaussderiv_kernel.width;
 }
 
+
 /*********************************************************************
  * _convolveImageHoriz
  */
- //runs on the kernel 
-__global__ void convolveHorizontalKernel ( const float *d_imgin, //input image
-int ncols, int nrows, //height and width 
-const float *d_kernel, //device convolution array 
-int kwidth, //kernel width  
-float *d_imgout //output image 
-) 
-{ 
-//compute indices
-  int col = blockIdx.x * blockDim.x + threadIdx.x;   // x => column
-  int row = blockIdx.y * blockDim.y + threadIdx.y;   // y => row
-  
-//boundary checking 
-  if (col >= ncols || row >= nrows) return; 
-  
-//radius = half of kernel width and out index is our picture index in this thread for the output image  
-  const int radius = kwidth / 2; 
-  int out_idx = row * ncols + col;
-  
-//handle left and right pixels of the image
-  if (col < radius || col > = (ncols - radius)) {
-    d_imgout[out_idx] = 0.0f;  //make left and right columns 0. same as c code 
-    return;
-  }
 
+//this function it blurs or filters the image along the x-direction (left to right) using a 1D kernel.
+//static void _convolveImageHoriz(
+//  _KLT_FloatImage imgin, 
+//  ConvolutionKernel kernel,
+//  _KLT_FloatImage imgout)
+//{
+//  float *ptrrow = imgin->data;           /* Points to row's first pixel */
+//  register float *ptrout = imgout->data, /* Points to next output pixel */
+//    *ppp;
+//  register float sum;
+//  register int radius = kernel.width / 2;
+//  register int ncols = imgin->ncols, nrows = imgin->nrows;
+//  register int i, j, k;
+//
+//  /* Kernel width must be odd */
+//  assert(kernel.width % 2 == 1);
+//
+//  /* Must read from and write to different images */
+//  assert(imgin != imgout);
+//
+//  /* Output image must be large enough to hold result */
+//  assert(imgout->ncols >= imgin->ncols);
+//  assert(imgout->nrows >= imgin->nrows);
+//
+//  /* For each row, do ... */
+//  for (j = 0 ; j < nrows ; j++)  {
+//
+//    /* Zero leftmost columns */
+//    for (i = 0 ; i < radius ; i++)
+//      *ptrout++ = 0.0;
+//
+//    /* Convolve middle columns with kernel */
+//    for ( ; i < ncols - radius ; i++)  {
+//      ppp = ptrrow + i - radius;
+//      sum = 0.0;
+//      for (k = kernel.width-1 ; k >= 0 ; k--)
+//        sum += *ppp++ * kernel.data[k];
+//      *ptrout++ = sum;
+//    }
+//
+//    /* Zero rightmost columns */
+//    for ( ; i < ncols ; i++)
+//      *ptrout++ = 0.0;
+//
+//    ptrrow += ncols;
+//  }
+//}
 
-  float sum = 0.0f; //init with zero 
-  const int start = col - radius;   // leftmost pixel covered by kernel on this row
-  int in_base = row * ncols + start; //
-  
-  // multiply input pixels by kernel weights 
-  for (int k = 0; k < kwidth; ++k) {
-    sum += d_imgin[in_base + k] * d_kernel[k];
-  }
-  
-  d_imgout[out_idx] = sum;
-}
-
-//host function 
-//copies data to device
-//launches kernel
-//copies data back 
-
-void _convolveImageHoriz_cuda(
-    const _KLT_FloatImage *imgin,    /* host input image */
-    const ConvolutionKernel kernel,  /* host kernel */
-    _KLT_FloatImage *imgout)         /* host output image */
+__global__ void convolveImageHorizKernel(
+    const float* imgin,
+    const float* kernel_data,
+    int kernel_width,
+    int ncols,
+    int nrows,
+    float* imgout)
 {
-  assert(kernel.width % 2 == 1); //check that kernel width is odd
-  assert(imgin != imgout); //both input and output images should be distinct 
-  assert(imgout->ncols >= imgin->ncols); //output image mustnt be smaller
-  assert(imgout->nrows >= imgin->nrows); // ^^ 
-  
-//initialise const sizes and boundaries 
-  const int ncols = imgin->ncols; 
-  const int nrows = imgin->nrows;
-  const size_t npixels = (size_t)ncols * (size_t)nrows;
-  const size_t nbytes = npixels * sizeof(float);
-  const int kw = kernel.width;
-  const size_t kernel_bytes = kw * sizeof(float);
-  
-   // Allocate device buffers for input output image and convol array 
-  float *d_imgin = NULL;
-  float *d_imgout = NULL;
-  float *d_kernel = NULL;
-  
-  //memory alloc with error check 
-  cudaCheck(cudaMalloc((void**)&d_imgin, nbytes));
-  cudaCheck(cudaMalloc((void**)&d_imgout, nbytes));
-  cudaCheck(cudaMalloc((void**)&d_kernel, kernel_bytes));
-  
-  //copy data 
-  //host to device 
-  cudaCheck(cudaMemcpy(d_imgin, imgin->data, nbytes, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpy(d_kernel, kernel.data, kernel_bytes, cudaMemcpyHostToDevice));
+    int i = blockIdx.x * blockDim.x + threadIdx.x;  // column index
+    int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
 
-//set launch configuration
-//test config
-  dim3 block(16, 16);
-  dim3 grid((ncols + block.x - 1) / block.x, (nrows + block.y - 1) / block.y);
+    if (i >= ncols || j >= nrows)
+        return;
 
-//launch kernel
-  convolveHorizKernel<<<gridDim, blockDim>>>(d_imgin, ncols, nrows, d_kernel, kw, d_imgout);
-  cudaCheck(cudaGetLastError());
-  cudaCheck(cudaDeviceSynchronize());
-  
-  //copy result back to host 
-  cudaCheck(cudaMemcpy(imgout->data, d_imgout, nbytes, cudaMemcpyDeviceToHost));
+    int radius = kernel_width / 2;
+    int out_idx = j * ncols + i;
 
-  //free device memory 
-  cudaCheck(cudaFree(d_imgin));
-  cudaCheck(cudaFree(d_imgout));
-  cudaCheck(cudaFree(d_kernel));
-
-}
-
-
-
-
-//it blurs or filters the image along the x-direction (left to right) using a 1D kernel
-//to parallelise use one thread for one pixel
-
-/*
-static void _convolveImageHoriz(
-  _KLT_FloatImage imgin, //input image 
-  ConvolutionKernel kernel, //the 1D convolution array of weights
-  _KLT_FloatImage imgout) //output array 
-{
-  float *ptrrow = imgin->data;           // Points to row's first pixel 
-  register float *ptrout = imgout->data, // Points to next output pixel 
-    *ppp; //temporary pointer for use during convultion
-  register float sum; //holds the convolution result for one pixel 
-  register int radius = kernel.width / 2; //half of kernel width 
-  register int ncols = imgin->ncols, nrows = imgin->nrows; //image width and height  
-  register int i, j, k; //loop variables 
-
-  // Kernel width must be odd 
-  assert(kernel.width % 2 == 1); 
-
-  // Must read from and write to different images //
-  assert(imgin != imgout);
-
-  // Output image must be large enough to hold result //
-  assert(imgout->ncols >= imgin->ncols);
-  assert(imgout->nrows >= imgin->nrows);
-
-  // For each row, do ... 
-  for (j = 0 ; j < nrows ; j++)  { 
-
-    // Zero leftmost columns 
-    for (i = 0 ; i < radius ; i++)
-      *ptrout++ = 0.0; //The kernel cannot fully overlap the image near the left edge (not enough pixels to the left), so these pixels are set to 0.
-
-    // Convolve middle columns with kernel 
-    for ( ; i < ncols - radius ; i++)  {
-      ppp = ptrrow + i - radius;
-      sum = 0.0;
-      for (k = kernel.width-1 ; k >= 0 ; k--)
-        sum += *ppp++ * kernel.data[k];
-      *ptrout++ = sum;
+    // Zero leftmost columns
+    if (i < radius) {
+        imgout[out_idx] = 0.0f;
+        return;
     }
 
-    // Zero rightmost columns 
-    for ( ; i < ncols ; i++)
-      *ptrout++ = 0.0;
+    // Zero rightmost columns
+    if (i >= ncols - radius) {
+        imgout[out_idx] = 0.0f;
+        return;
+    }
 
-    ptrrow += ncols;
-  }
+    // Convolve middle columns with kernel
+    float sum = 0.0f;
+    int row_start = j * ncols;
+
+    for (int k = kernel_width - 1; k >= 0; k--) {
+        int ppp_idx = row_start + i - radius + (kernel_width - 1 - k);
+        sum += imgin[ppp_idx] * kernel_data[k];
+    }
+
+    imgout[out_idx] = sum;
 }
-*/
 
+// CUDA version of _convolveImageHoriz
+static void _convolveImageHoriz_cuda(
+    _KLT_FloatImage imgin,
+    ConvolutionKernel kernel,
+    _KLT_FloatImage imgout)
+{
+    int ncols = imgin->ncols;
+    int nrows = imgin->nrows;
+    size_t img_size = ncols * nrows * sizeof(float);
+    size_t kernel_size = kernel.width * sizeof(float);
+
+    // Allocate device memory
+    float* d_imgin, * d_imgout, * d_kernel;
+    cudaMalloc(&d_imgin, img_size);
+    cudaMalloc(&d_imgout, img_size);
+    cudaMalloc(&d_kernel, kernel_size);
+
+    // Copy data to device
+    cudaMemcpy(d_imgin, imgin->data, img_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kernel, kernel.data, kernel_size, cudaMemcpyHostToDevice);
+
+    // Configure and launch kernel
+    dim3 blockDim(16, 16);
+    dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
+        (nrows + blockDim.y - 1) / blockDim.y);
+
+    convolveImageHorizKernel << <gridDim, blockDim >> > (
+        d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
+
+    // Copy result back to host
+    cudaMemcpy(imgout->data, d_imgout, img_size, cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_imgin);
+    cudaFree(d_imgout);
+    cudaFree(d_kernel);
+}
 
 /*********************************************************************
  * _convolveImageVert
  */
 
-static void _convolveImageVert(
-  _KLT_FloatImage imgin,
-  ConvolutionKernel kernel,
-  _KLT_FloatImage imgout)
+//static void _convolveImageVert(
+//  _KLT_FloatImage imgin,
+//  ConvolutionKernel kernel,
+//  _KLT_FloatImage imgout)
+//{
+//  float *ptrcol = imgin->data;            /* Points to row's first pixel */
+//  register float *ptrout = imgout->data,  /* Points to next output pixel */
+//    *ppp;
+//  register float sum;
+//  register int radius = kernel.width / 2;
+//  register int ncols = imgin->ncols, nrows = imgin->nrows;
+//  register int i, j, k;
+//
+//  /* Kernel width must be odd */
+//  assert(kernel.width % 2 == 1);
+//
+//  /* Must read from and write to different images */
+//  assert(imgin != imgout);
+//
+//  /* Output image must be large enough to hold result */
+//  assert(imgout->ncols >= imgin->ncols);
+//  assert(imgout->nrows >= imgin->nrows);
+//
+//  /* For each column, do ... */
+//  for (i = 0 ; i < ncols ; i++)  {
+//
+//    /* Zero topmost rows */
+//    for (j = 0 ; j < radius ; j++)  {
+//      *ptrout = 0.0;
+//      ptrout += ncols;
+//    }
+//
+//    /* Convolve middle rows with kernel */
+//    for ( ; j < nrows - radius ; j++)  {
+//      ppp = ptrcol + ncols * (j - radius);
+//      sum = 0.0;
+//      for (k = kernel.width-1 ; k >= 0 ; k--)  {
+//        sum += *ppp * kernel.data[k];
+//        ppp += ncols;
+//      }
+//      *ptrout = sum;
+//      ptrout += ncols;
+//    }
+//
+//    /* Zero bottommost rows */
+//    for ( ; j < nrows ; j++)  {
+//      *ptrout = 0.0;
+//      ptrout += ncols;
+//    }
+//
+//    ptrcol++;
+//    ptrout -= nrows * ncols - 1;
+//  }
+//}
+
+// CUDA kernel for vertical convolution
+__global__ void convolveImageVertKernel(
+    const float* imgin,
+    const float* kernel_data,
+    int kernel_width,
+    int ncols,
+    int nrows,
+    float* imgout)
 {
-  float *ptrcol = imgin->data;            /* Points to row's first pixel */
-  register float *ptrout = imgout->data,  /* Points to next output pixel */
-    *ppp;
-  register float sum;
-  register int radius = kernel.width / 2;
-  register int ncols = imgin->ncols, nrows = imgin->nrows;
-  register int i, j, k;
-
-  /* Kernel width must be odd */
-  assert(kernel.width % 2 == 1);
-
-  /* Must read from and write to different images */
-  assert(imgin != imgout);
-
-  /* Output image must be large enough to hold result */
-  assert(imgout->ncols >= imgin->ncols);
-  assert(imgout->nrows >= imgin->nrows);
-
-  /* For each column, do ... */
-  for (i = 0 ; i < ncols ; i++)  {
-
-    /* Zero topmost rows */
-    for (j = 0 ; j < radius ; j++)  {
-      *ptrout = 0.0;
-      ptrout += ncols;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;  // column index
+    int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
+    
+    if (i >= ncols || j >= nrows)
+        return;
+    
+    int radius = kernel_width / 2;
+    int out_idx = j * ncols + i;
+    
+    // Zero topmost rows
+    if (j < radius) {
+        imgout[out_idx] = 0.0f;
+        return;
     }
-
-    /* Convolve middle rows with kernel */
-    for ( ; j < nrows - radius ; j++)  {
-      ppp = ptrcol + ncols * (j - radius);
-      sum = 0.0;
-      for (k = kernel.width-1 ; k >= 0 ; k--)  {
-        sum += *ppp * kernel.data[k];
-        ppp += ncols;
-      }
-      *ptrout = sum;
-      ptrout += ncols;
+    
+    // Zero bottommost rows
+    if (j >= nrows - radius) {
+        imgout[out_idx] = 0.0f;
+        return;
     }
-
-    /* Zero bottommost rows */
-    for ( ; j < nrows ; j++)  {
-      *ptrout = 0.0;
-      ptrout += ncols;
+    
+    // Convolve middle rows with kernel
+    float sum = 0.0f;
+    
+    for (int k = kernel_width - 1; k >= 0; k--) {
+        int ppp_idx = (j - radius + (kernel_width - 1 - k)) * ncols + i;
+        sum += imgin[ppp_idx] * kernel_data[k];
     }
+    
+    imgout[out_idx] = sum;
+}
 
-    ptrcol++;
-    ptrout -= nrows * ncols - 1;
-  }
+// CUDA version of _convolveImageVert
+static void _convolveImageVert_cuda(
+    _KLT_FloatImage imgin,
+    ConvolutionKernel kernel,
+    _KLT_FloatImage imgout)
+{
+    int ncols = imgin->ncols;
+    int nrows = imgin->nrows;
+    size_t img_size = ncols * nrows * sizeof(float);
+    size_t kernel_size = kernel.width * sizeof(float);
+
+    // Allocate device memory
+    float* d_imgin, * d_imgout, * d_kernel;
+    cudaMalloc(&d_imgin, img_size);
+    cudaMalloc(&d_imgout, img_size);
+    cudaMalloc(&d_kernel, kernel_size);
+
+    // Copy data to device
+    cudaMemcpy(d_imgin, imgin->data, img_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kernel, kernel.data, kernel_size, cudaMemcpyHostToDevice);
+
+    // Configure and launch kernel
+    dim3 blockDim(16, 16);
+    dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
+        (nrows + blockDim.y - 1) / blockDim.y);
+
+    convolveImageVertKernel << <gridDim, blockDim >> > (
+        d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
+
+    // Copy result back to host
+    cudaMemcpy(imgout->data, d_imgout, img_size, cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_imgin);
+    cudaFree(d_imgout);
+    cudaFree(d_kernel);
 }
 
 
@@ -349,22 +414,21 @@ static void _convolveImageVert(
  */
 
 static void _convolveSeparate(
-  _KLT_FloatImage imgin,
-  ConvolutionKernel horiz_kernel,
-  ConvolutionKernel vert_kernel,
-  _KLT_FloatImage imgout)
+    _KLT_FloatImage imgin,
+    ConvolutionKernel horiz_kernel,
+    ConvolutionKernel vert_kernel,
+    _KLT_FloatImage imgout)
 {
-  /* Create temporary image */
-  _KLT_FloatImage tmpimg;
-  tmpimg = _KLTCreateFloatImage(imgin->ncols, imgin->nrows);
-  
-  /* Do convolution */
-  _convolveImageHoriz(imgin, horiz_kernel, tmpimg);
-
-  _convolveImageVert(tmpimg, vert_kernel, imgout);
-
-  /* Free memory */
-  _KLTFreeFloatImage(tmpimg);
+    /* Create temporary image */
+    _KLT_FloatImage tmpimg;
+    tmpimg = _KLTCreateFloatImage(imgin->ncols, imgin->nrows);
+    
+    /* Do convolution */
+    _convolveImageHoriz_cuda(imgin, horiz_kernel, tmpimg);
+    _convolveImageVert_cuda(tmpimg, vert_kernel, imgout);
+    
+    /* Free memory */
+    _KLTFreeFloatImage(tmpimg);
 }
 
 	
@@ -414,6 +478,5 @@ void _KLTComputeSmoothedImage(
 
   _convolveSeparate(img, gauss_kernel, gauss_kernel, smooth);
 }
-
 
 
