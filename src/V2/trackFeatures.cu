@@ -216,109 +216,112 @@ void _computeIntensityDifference_cuda(
  * overlaid gradients.
  */
 
-//basically this function measures how the brightness changes in both photos and adds those changes together for each small pixel block in that area.
-
-__global__ void _computeGradientSumKernel(
-  _KLT_FloatImage gradx1,  // gradient images 
-  _KLT_FloatImage grady1,
-  _KLT_FloatImage gradx2,
-  _KLT_FloatImage grady2,
-  float x1, float y1,      // center of window in 1st img 
-  float x2, float y2,      // center of window in 2nd img 
-  int width, int height,   // size of window 
-  float* gradx,      // output 
-  float* grady){
-  // Compute pixel coordinates in the window
-    int i = blockIdx.x * blockDim.x + threadIdx.x - width / 2;
-    int j = blockIdx.y * blockDim.y + threadIdx.y - height / 2;
-
-    // Ensure we're within the window bounds
-    int hw = width/2, hh = height/2;
-    if (i < -hw || i > hw || j < -hh || j > hh)
-        return;
-      
-      // Map (i, j) to 1D index in FloatWindow
-    int local_i = i + hw;
-    int local_j = j + hh;
-    int idx = local_j * width + local_i;
-      
-      //interpolate the gradients
-      g1 = _interpolate(x1+i, y1+j, gradx1);
-      g2 = _interpolate(x2+i, y2+j, gradx2);
-      g1 = _interpolate(x1+i, y1+j, grady1);
-      g2 = _interpolate(x2+i, y2+j, grady2);
-      
-        
-      // Store summed gradients
-    gradx[idx] = g1x + g2x;
-    grady[idx] = g1y + g2y;
-        
-
-}
-
-
 static void _computeGradientSum(
-  _KLT_FloatImage gradx1,  // gradient images 
+  _KLT_FloatImage gradx1,  /* gradient images */
   _KLT_FloatImage grady1,
   _KLT_FloatImage gradx2,
   _KLT_FloatImage grady2,
-  float x1, float y1,      // center of window in 1st img 
-  float x2, float y2,      // center of window in 2nd img 
-  int width, int height,   // size of window 
-  _FloatWindow gradx,      // output 
-  _FloatWindow grady)      //   " 
+  float x1, float y1,      /* center of window in 1st img */
+  float x2, float y2,      /* center of window in 2nd img */
+  int width, int height,   /* size of window */
+  _FloatWindow gradx,      /* output */
+  _FloatWindow grady)      /*   " */
 {
-// --- Setup ---
-  int windowSize = width * height * sizeof(float);
-  float *d_gradx_out, *d_grady_out;
+  register int hw = width/2, hh = height/2;
+  float g1, g2;
+  register int i, j;
 
-  // Allocate device memory for outputs
-  cudaMalloc(&d_gradx_out, windowSize);
-  cudaMalloc(&d_grady_out, windowSize);
-
-  // Copy image data to device
-  _KLT_FloatImage d_gradx1 = gradx1;
-  _KLT_FloatImage d_grady1 = grady1;
-  _KLT_FloatImage d_gradx2 = gradx2;
-  _KLT_FloatImage d_grady2 = grady2;
-
-  //allocate memory
-  cudaMalloc(&d_gradx1.data, gradx1.ncols * gradx1.nrows * sizeof(float));
-  cudaMalloc(&d_grady1.data, grady1.ncols * grady1.nrows * sizeof(float));
-  cudaMalloc(&d_gradx2.data, gradx2.ncols * gradx2.nrows * sizeof(float));
-  cudaMalloc(&d_grady2.data, grady2.ncols * grady2.nrows * sizeof(float));
-
-  //copy to device
-  cudaMemcpy(d_gradx1.data, gradx1.data,  gradx1.ncols * gradx1.nrows * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_grady1.data, grady1.data, grady1.ncols * grady1.nrows * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_gradx2.data, gradx2.data, gradx2.ncols * gradx2.nrows * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_grady2.data, grady2.data, grady2.ncols * grady2.nrows * sizeof(float), cudaMemcpyHostToDevice);
-
-// --- Launch configuration ---
-//test config
-  dim3 blockDim(16, 16);
-  dim3 gridDim((width + blockDim.x - 1) / blockDim.x, (height + blockDim.y - 1) / blockDim.y);
-
-  // --- Launch kernel ---
-  _computeGradientSumKernel<<<gridDim, blockDim>>>( d_gradx1, d_grady1, d_gradx2, d_grady2,x1, y1, x2, y2, width, height, d_gradx_out, d_grady_out);
-
-  cudaDeviceSynchronize();
-  
-   // --- Copy results back to host ---
-  cudaMemcpy(gradx, d_gradx_out, windowSize, cudaMemcpyDeviceToHost);
-  cudaMemcpy(grady, d_grady_out, windowSize, cudaMemcpyDeviceToHost);
-
-  // --- Free device memory ---
-  cudaFree(d_gradx1.data);
-  cudaFree(d_grady1.data);
-  cudaFree(d_gradx2.data);
-  cudaFree(d_grady2.data);
-  cudaFree(d_gradx_out);
-  cudaFree(d_grady_out);
-
+  /* Compute values */
+  for (j = -hh ; j <= hh ; j++)
+    for (i = -hw ; i <= hw ; i++)  {
+      g1 = interpolate_cuda(x1+i, y1+j, gradx1);
+      g2 = interpolate_cuda(x2+i, y2+j, gradx2);
+      *gradx++ = g1 + g2;
+      g1 = interpolate_cuda(x1+i, y1+j, grady1);
+      g2 = interpolate_cuda(x2+i, y2+j, grady2);
+      *grady++ = g1 + g2;
+    }
 }
 
- 
+__global__ void computeGradientSumKernel(
+	const float* gradx1, const float* grady1,
+	const float* gradx2, const float* grady2,
+	float* gradx_out, float* grady_out,
+	float x1, float y1, float x2, float y2,
+	int width, int height,
+	int imgWidth, int imgHeight)
+{
+	int tx = blockIdx.x * blockDim.x + threadIdx.x;
+	int ty = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (tx >= width || ty >= height) return;
+
+	int hw = width / 2;
+	int hh = height / 2;
+
+	int i = tx - hw;
+	int j = ty - hh;
+
+	float g1x = interpolate_cuda(x1 + i, y1 + j, gradx1, imgWidth, imgHeight);
+	float g2x = interpolate_cuda(x2 + i, y2 + j, gradx2, imgWidth, imgHeight);
+	gradx_out[ty * width + tx] = g1x + g2x;
+
+	float g1y = interpolate_cuda(x1 + i, y1 + j, grady1, imgWidth, imgHeight);
+	float g2y = interpolate_cuda(x2 + i, y2 + j, grady2, imgWidth, imgHeight);
+	grady_out[ty * width + tx] = g1y + g2y;
+}
+
+
+
+static void _computeGradientSum_cuda(
+	_KLT_FloatImage gradx1, _KLT_FloatImage grady1,
+	_KLT_FloatImage gradx2, _KLT_FloatImage grady2,
+	float x1, float y1,
+	float x2, float y2,
+	int width, int height,
+	_FloatWindow gradx, _FloatWindow grady)
+{
+	int imgWidth = gradx1->ncols;
+	int imgHeight = gradx1->nrows;
+
+	size_t imgBytes = imgWidth * imgHeight * sizeof(float);
+	size_t winBytes = width * height * sizeof(float);
+
+	float* d_gradx1, * d_grady1, * d_gradx2, * d_grady2;
+	float* d_gradx_out, * d_grady_out;
+
+	cudaMalloc(&d_gradx1, imgBytes);
+	cudaMalloc(&d_grady1, imgBytes);
+	cudaMalloc(&d_gradx2, imgBytes);
+	cudaMalloc(&d_grady2, imgBytes);
+	cudaMalloc(&d_gradx_out, winBytes);
+	cudaMalloc(&d_grady_out, winBytes);
+
+	cudaMemcpy(d_gradx1, gradx1->data, imgBytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_grady1, grady1->data, imgBytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_gradx2, gradx2->data, imgBytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_grady2, grady2->data, imgBytes, cudaMemcpyHostToDevice);
+
+	// Full parallel launch over the window
+	dim3 block(16, 16);
+	dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+	computeGradientSumKernel << <grid, block >> > (
+		d_gradx1, d_grady1, d_gradx2, d_grady2,
+		d_gradx_out, d_grady_out,
+		x1, y1, x2, y2,
+		width, height,
+		imgWidth, imgHeight
+		);
+	cudaDeviceSynchronize();
+
+	cudaMemcpy(gradx, d_gradx_out, winBytes, cudaMemcpyDeviceToHost);
+	cudaMemcpy(grady, d_grady_out, winBytes, cudaMemcpyDeviceToHost);
+
+	cudaFree(d_gradx1); cudaFree(d_grady1);
+	cudaFree(d_gradx2); cudaFree(d_grady2);
+	cudaFree(d_gradx_out); cudaFree(d_grady_out);
+}
 
 
 /*********************************************************************
@@ -1726,6 +1729,7 @@ void KLTTrackFeatures(
 	}
 
 }
+
 
 
 
