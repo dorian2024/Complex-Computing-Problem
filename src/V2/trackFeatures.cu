@@ -136,6 +136,78 @@ static void _computeIntensityDifference(
 }
 
 
+//kernel function
+__global__ void computeIntensityDifferenceKernel(
+	const float* img1,
+	const float* img2,
+	int ncols, int nrows,
+	float x1, float y1,
+	float x2, float y2,
+	int width,
+	int height,
+	float* imgdiff)   // flat array of size width*height
+{
+	int i_idx = threadIdx.x + blockIdx.x * blockDim.x;
+	int j_idx = threadIdx.y + blockIdx.y * blockDim.y;
+
+	int hw = width / 2;
+	int hh = height / 2;
+
+	if (i_idx > width - 1 || j_idx > height - 1) return;
+
+	int i = i_idx - hw;
+	int j = j_idx - hh;
+
+	float g1 = interpolate_cuda(x1 + i, y1 + j, img1, ncols, nrows);
+	float g2 = interpolate_cuda(x2 + i, y2 + j, img2, ncols, nrows);
+
+	imgdiff[j_idx * width + i_idx] = g1 - g2;
+}
+
+//wrapper
+void _computeIntensityDifference_cuda(
+	_KLT_FloatImage img1,
+	_KLT_FloatImage img2,
+	float x1, float y1,
+	float x2, float y2,
+	int width,
+	int height,
+	_FloatWindow imgdiff)  // float* of size width*height
+{
+	const size_t img_bytes = img1->ncols * img1->nrows * sizeof(float);
+	const size_t diff_bytes = width * height * sizeof(float);
+
+	float* d_img1, *d_img2, *d_diff;
+	d_img1 = nullptr;
+	d_img2 = nullptr;
+	d_diff = nullptr;
+	cudaCheck(cudaMalloc(&d_img1, img_bytes));
+	cudaCheck(cudaMalloc(&d_img2, img_bytes));
+	cudaCheck(cudaMalloc(&d_diff, diff_bytes));
+
+	cudaCheck(cudaMemcpy(d_img1, img1->data, img_bytes, cudaMemcpyHostToDevice));
+	cudaCheck(cudaMemcpy(d_img2, img2->data, img_bytes, cudaMemcpyHostToDevice));
+
+	dim3 blockDim(16, 16);
+	dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
+		(height + blockDim.y - 1) / blockDim.y);
+
+	computeIntensityDifferenceKernel<<<gridDim, blockDim >> > (
+		d_img1, d_img2, img1->ncols, img1->nrows,
+		x1, y1, x2, y2, width, height, d_diff
+		);
+	cudaCheck(cudaGetLastError());
+	cudaCheck(cudaDeviceSynchronize());
+
+	cudaCheck(cudaMemcpy(imgdiff, d_diff, diff_bytes, cudaMemcpyDeviceToHost));
+
+	cudaCheck(cudaFree(d_img1));
+	cudaCheck(cudaFree(d_img2));
+	cudaCheck(cudaFree(d_diff));
+}
+
+
+
 /*********************************************************************
  * _computeGradientSum
  *
@@ -1654,6 +1726,7 @@ void KLTTrackFeatures(
 	}
 
 }
+
 
 
 
