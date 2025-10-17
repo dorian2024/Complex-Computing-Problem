@@ -17,9 +17,35 @@
 #include "klt_util.h"	// _KLT_FloatImage 
 #include "pyramid.h"	// _KLT_Pyramid 
 
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern int KLT_verbose;
 
+#ifdef __cplusplus
+}
+#endif
+
+
+
 typedef float *_FloatWindow;
+
+//macro for cuda check
+#define cudaCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+	if (code != cudaSuccess) {
+		fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(code), file, line);
+		if (abort) exit(code);
+	}
+}
 
 /*********************************************************************
  * _interpolate
@@ -48,6 +74,33 @@ static float _interpolate( float x, float y, _KLT_FloatImage img)
   //checking bounds of image
 
   return ( (1-ax) * (1-ay) * (*ptr) + ax*(1-ay)* (*(ptr+1)) + (1-ax) *ay* (*(ptr+(img->ncols))) + ax * ay * (*(ptr+(img->ncols)+1)));
+}
+
+
+//interpolate kernel function
+__host__ __device__ float interpolate_cuda(
+	float x, float y,
+	const float* img, int imgWidth, int imgHeight)
+{
+	int xt = (int)x;
+	int yt = (int)y;
+	float ax = x - xt;
+	float ay = y - yt;
+
+	if (xt < 0 || yt < 0 || xt >= imgWidth - 1 || yt >= imgHeight - 1)
+		return 0.0f;
+
+	const float* ptr = img + yt * imgWidth + xt;
+
+	float v00 = ptr[0];
+	float v10 = ptr[1];
+	float v01 = ptr[imgWidth];
+	float v11 = ptr[imgWidth + 1];
+
+	return (1 - ax) * (1 - ay) * v00 +
+		ax * (1 - ay) * v10 +
+		(1 - ax) * ay * v01 +
+		ax * ay * v11;
 }
 
 
@@ -1601,6 +1654,7 @@ void KLTTrackFeatures(
 	}
 
 }
+
 
 
 
