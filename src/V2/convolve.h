@@ -8,6 +8,14 @@
 #include "klt.h"
 #include "klt_util.h"
 
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void _KLTToFloatImage(
   KLT_PixelType *img,
   int ncols, int nrows,
@@ -28,5 +36,9 @@ void _KLTComputeSmoothedImage(
   _KLT_FloatImage img,
   float sigma,
   _KLT_FloatImage smooth);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
