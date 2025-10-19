@@ -14,42 +14,119 @@
 #include "error.h"
 #include "convolve.h"	/* for computing pyramid */
 #include "klt.h"
-#include "klt_util.h"	// _KLT_FloatImage 
-#include "pyramid.h"	// _KLT_Pyramid 
+#include "klt_util.h"	/* _KLT_FloatImage */
+#include "pyramid.h"	/* _KLT_Pyramid */
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+#define cudaCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+	if (code != cudaSuccess) {
+		fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(code), file, line);
+		if (abort) exit(code);
+	}
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 extern int KLT_verbose;
+
+#ifdef __cplusplus
+}
+#endif
+
 
 typedef float *_FloatWindow;
 
 /*********************************************************************
- * _interpolate
+ * interpolate_cuda
  * 
  * Given a point (x,y) in an image, computes the bilinear interpolated 
  * gray-level value of the point in the image.  
  */
 
-static float _interpolate( float x, float y, _KLT_FloatImage img)
+//static float interpolate(
+//  float x, 
+//  float y, 
+//  _KLT_FloatImage img)
+//{
+//  int xt = (int) x;  /* coordinates of top-left corner */
+//  int yt = (int) y;
+//  float ax = x - xt;
+//  float ay = y - yt;
+//  float *ptr = img->data + (img->ncols*yt) + xt;
+//
+//#ifndef _DNDEBUG
+//  if (xt<0 || yt<0 || xt>=img->ncols-1 || yt>=img->nrows-1) {
+//    fprintf(stderr, "(xt,yt)=(%d,%d)  imgsize=(%d,%d)\n"
+//            "(x,y)=(%f,%f)  (ax,ay)=(%f,%f)\n",
+//            xt, yt, img->ncols, img->nrows, x, y, ax, ay);
+//    fflush(stderr);
+//  }
+//#endif
+//
+//  assert (xt >= 0 && yt >= 0 && xt <= img->ncols - 2 && yt <= img->nrows - 2);
+//
+//  return ( (1-ax) * (1-ay) * *ptr +
+//           ax   * (1-ay) * *(ptr+1) +
+//           (1-ax) *   ay   * *(ptr+(img->ncols)) +
+//           ax   *   ay   * *(ptr+(img->ncols)+1) );
+//}
+
+__host__ __device__ float interpolate_cuda(
+	float x, float y,
+	_KLT_FloatImage img)
 {
-  int xt = (int) x;  /* coordinates of top-left corner */
-  int yt = (int) y;
-  float ax = x - xt; //decimal portion of x
-  float ay = y - yt; // ^^ of y
-  float *ptr = img->data + (img->ncols*yt) + xt; //points to the start
+	int xt = (int)x;
+	int yt = (int)y;
+	float ax = x - xt;
+	float ay = y - yt;
 
-#ifndef _DNDEBUG
-  if (xt<0 || yt<0 || xt>=img->ncols-1 || yt>=img->nrows-1) { //error check 
-    fprintf(stderr, "(xt,yt)=(%d,%d)  imgsize=(%d,%d)\n" "(x,y)=(%f,%f)  (ax,ay)=(%f,%f)\n",
-            xt, yt, img->ncols, img->nrows, x, y, ax, ay);
-    fflush(stderr);
-  }
-#endif
+	if (xt < 0 || yt < 0 || xt >= img->ncols - 1 || yt >= img->nrows - 1)
+		return 0.0f;
 
-  assert (xt >= 0 && yt >= 0 && xt <= img->ncols - 2 && yt <= img->nrows - 2); //should be true
-  //checking bounds of image
+	const float* ptr = img->data + yt * img->ncols + xt;
 
-  return ( (1-ax) * (1-ay) * (*ptr) + ax*(1-ay)* (*(ptr+1)) + (1-ax) *ay* (*(ptr+(img->ncols))) + ax * ay * (*(ptr+(img->ncols)+1)));
+	float v00 = ptr[0];
+	float v10 = ptr[1];
+	float v01 = ptr[img->ncols];
+	float v11 = ptr[img->ncols + 1];
+
+	return (1 - ax) * (1 - ay) * v00 +
+		ax * (1 - ay) * v10 +
+		(1 - ax) * ay * v01 +
+		ax * ay * v11;
 }
 
+__host__ __device__ float interpolate_cuda(
+	float x, float y,
+	const float* img, int imgWidth, int imgHeight)
+{
+	int xt = (int)x;
+	int yt = (int)y;
+	float ax = x - xt;
+	float ay = y - yt;
+
+	if (xt < 0 || yt < 0 || xt >= imgWidth - 1 || yt >= imgHeight - 1)
+		return 0.0f;
+
+	const float* ptr = img + yt * imgWidth + xt;
+
+	float v00 = ptr[0];
+	float v10 = ptr[1];
+	float v01 = ptr[imgWidth];
+	float v11 = ptr[imgWidth + 1];
+
+	return (1 - ax) * (1 - ay) * v00 +
+		ax * (1 - ay) * v10 +
+		(1 - ax) * ay * v01 +
+		ax * ay * v11;
+}
 
 /*********************************************************************
  * _computeIntensityDifference
@@ -59,28 +136,96 @@ static float _interpolate( float x, float y, _KLT_FloatImage img)
  * between the two overlaid images.
  */
 
-static void _computeIntensityDifference(
-//computes the pixel-wise intensity difference between the two windows.
+//static void _computeIntensityDifference(
+//  _KLT_FloatImage img1,   /* images */
+//  _KLT_FloatImage img2,
+//  float x1, float y1,     /* center of window in 1st img */
+//  float x2, float y2,     /* center of window in 2nd img */
+//  int width, int height,  /* size of window */
+//  _FloatWindow imgdiff)   /* output */
+//{
+//  register int hw = width/2, hh = height/2;
+//  float g1, g2;
+//  register int i, j;
+//
+//  /* Compute values */
+//  for (j = -hh ; j <= hh ; j++)
+//    for (i = -hw ; i <= hw ; i++)  {
+//      g1 = interpolate_cuda(x1+i, y1+j, img1);
+//      g2 = interpolate_cuda(x2+i, y2+j, img2);
+//      *imgdiff++ = g1 - g2;
+//    }
+//}
 
-  _KLT_FloatImage img1,   /* images */
-  _KLT_FloatImage img2,
-  float x1, float y1,     /* center of window in 1st img */
-  float x2, float y2,     /* center of window in 2nd img */
-  int width, int height,  /* size of window */
-  _FloatWindow imgdiff)   /* output */
+__global__ void computeIntensityDifferenceKernel(
+	const float* img1,
+	const float* img2,
+	int ncols, int nrows,
+	float x1, float y1,
+	float x2, float y2,
+	int width,
+	int height,
+	float* imgdiff)
 {
-  register int hw = width/2, hh = height/2; //half width half height
-  float g1, g2;
-  register int i, j;
+	int i_idx = threadIdx.x + blockIdx.x * blockDim.x;
+	int j_idx = threadIdx.y + blockIdx.y * blockDim.y;
 
-  /* Compute values */
-  for (j = -hh ; j <= hh ; j++) //why negative? so it takes pixel values above and below the center 
-    for (i = -hw ; i <= hw ; i++)  {
-      g1 = _interpolate(x1+i, y1+j, img1);
-      g2 = _interpolate(x2+i, y2+j, img2);
-      *imgdiff++ = g1 - g2;
-    }
+	int hw = width / 2;
+	int hh = height / 2;
+
+	if (i_idx > width - 1 || j_idx > height - 1) return;
+
+	int i = i_idx - hw;
+	int j = j_idx - hh;
+
+	// Use the 5-parameter version for device code
+	float g1 = interpolate_cuda(x1 + i, y1 + j, img1, ncols, nrows);
+	float g2 = interpolate_cuda(x2 + i, y2 + j, img2, ncols, nrows);
+
+	imgdiff[j_idx * width + i_idx] = g1 - g2;
 }
+
+void _computeIntensityDifference_cuda(
+	_KLT_FloatImage img1,
+	_KLT_FloatImage img2,
+	float x1, float y1,
+	float x2, float y2,
+	int width,
+	int height,
+	_FloatWindow imgdiff)  // float* of size width*height
+{
+	const size_t img_bytes = img1->ncols * img1->nrows * sizeof(float);
+	const size_t diff_bytes = width * height * sizeof(float);
+
+	float* d_img1, *d_img2, *d_diff;
+	d_img1 = nullptr;
+	d_img2 = nullptr;
+	d_diff = nullptr;
+	cudaCheck(cudaMalloc(&d_img1, img_bytes));
+	cudaCheck(cudaMalloc(&d_img2, img_bytes));
+	cudaCheck(cudaMalloc(&d_diff, diff_bytes));
+
+	cudaCheck(cudaMemcpy(d_img1, img1->data, img_bytes, cudaMemcpyHostToDevice));
+	cudaCheck(cudaMemcpy(d_img2, img2->data, img_bytes, cudaMemcpyHostToDevice));
+
+	dim3 blockDim(16, 16);
+	dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
+		(height + blockDim.y - 1) / blockDim.y);
+
+	computeIntensityDifferenceKernel<<<gridDim, blockDim >> > (
+		d_img1, d_img2, img1->ncols, img1->nrows,
+		x1, y1, x2, y2, width, height, d_diff
+		);
+	cudaCheck(cudaGetLastError());
+	cudaCheck(cudaDeviceSynchronize());
+
+	cudaCheck(cudaMemcpy(imgdiff, d_diff, diff_bytes, cudaMemcpyDeviceToHost));
+
+	cudaCheck(cudaFree(d_img1));
+	cudaCheck(cudaFree(d_img2));
+	cudaCheck(cudaFree(d_diff));
+}
+
 
 
 /*********************************************************************
@@ -91,110 +236,112 @@ static void _computeIntensityDifference(
  * overlaid gradients.
  */
 
-//basically this function measures how the brightness changes in both photos and adds those changes together for each small pixel block in that area.
+//static void _computeGradientSum(
+//  _KLT_FloatImage gradx1,  /* gradient images */
+//  _KLT_FloatImage grady1,
+//  _KLT_FloatImage gradx2,
+//  _KLT_FloatImage grady2,
+//  float x1, float y1,      /* center of window in 1st img */
+//  float x2, float y2,      /* center of window in 2nd img */
+//  int width, int height,   /* size of window */
+//  _FloatWindow gradx,      /* output */
+//  _FloatWindow grady)      /*   " */
+//{
+//  register int hw = width/2, hh = height/2;
+//  float g1, g2;
+//  register int i, j;
+//
+//  /* Compute values */
+//  for (j = -hh ; j <= hh ; j++)
+//    for (i = -hw ; i <= hw ; i++)  {
+//      g1 = interpolate(x1+i, y1+j, gradx1);
+//      g2 = interpolate(x2+i, y2+j, gradx2);
+//      *gradx++ = g1 + g2;
+//      g1 = interpolate(x1+i, y1+j, grady1);
+//      g2 = interpolate(x2+i, y2+j, grady2);
+//      *grady++ = g1 + g2;
+//    }
+//}
 
-__global__ void _computeGradientSumKernel(
-  _KLT_FloatImage gradx1,  // gradient images 
-  _KLT_FloatImage grady1,
-  _KLT_FloatImage gradx2,
-  _KLT_FloatImage grady2,
-  float x1, float y1,      // center of window in 1st img 
-  float x2, float y2,      // center of window in 2nd img 
-  int width, int height,   // size of window 
-  float* gradx,      // output 
-  float* grady){
-  // Compute pixel coordinates in the window
-    int i = blockIdx.x * blockDim.x + threadIdx.x - width / 2;
-    int j = blockIdx.y * blockDim.y + threadIdx.y - height / 2;
-
-    // Ensure we're within the window bounds
-    int hw = width/2, hh = height/2;
-    if (i < -hw || i > hw || j < -hh || j > hh)
-        return;
-      
-      // Map (i, j) to 1D index in FloatWindow
-    int local_i = i + hw;
-    int local_j = j + hh;
-    int idx = local_j * width + local_i;
-      
-      //interpolate the gradients
-      g1 = _interpolate(x1+i, y1+j, gradx1);
-      g2 = _interpolate(x2+i, y2+j, gradx2);
-      g1 = _interpolate(x1+i, y1+j, grady1);
-      g2 = _interpolate(x2+i, y2+j, grady2);
-      
-        
-      // Store summed gradients
-    gradx[idx] = g1x + g2x;
-    grady[idx] = g1y + g2y;
-        
-
-}
-
-
-static void _computeGradientSum(
-  _KLT_FloatImage gradx1,  // gradient images 
-  _KLT_FloatImage grady1,
-  _KLT_FloatImage gradx2,
-  _KLT_FloatImage grady2,
-  float x1, float y1,      // center of window in 1st img 
-  float x2, float y2,      // center of window in 2nd img 
-  int width, int height,   // size of window 
-  _FloatWindow gradx,      // output 
-  _FloatWindow grady)      //   " 
+__global__ void computeGradientSumKernel(
+	const float* gradx1, const float* grady1,
+	const float* gradx2, const float* grady2,
+	float* gradx_out, float* grady_out,
+	float x1, float y1, float x2, float y2,
+	int width, int height,
+	int imgWidth, int imgHeight)
 {
-// --- Setup ---
-  int windowSize = width * height * sizeof(float);
-  float *d_gradx_out, *d_grady_out;
+	int tx = blockIdx.x * blockDim.x + threadIdx.x;
+	int ty = blockIdx.y * blockDim.y + threadIdx.y;
 
-  // Allocate device memory for outputs
-  cudaMalloc(&d_gradx_out, windowSize);
-  cudaMalloc(&d_grady_out, windowSize);
+	if (tx >= width || ty >= height) return;
 
-  // Copy image data to device
-  _KLT_FloatImage d_gradx1 = gradx1;
-  _KLT_FloatImage d_grady1 = grady1;
-  _KLT_FloatImage d_gradx2 = gradx2;
-  _KLT_FloatImage d_grady2 = grady2;
+	int hw = width / 2;
+	int hh = height / 2;
 
-  //allocate memory
-  cudaMalloc(&d_gradx1.data, gradx1.ncols * gradx1.nrows * sizeof(float));
-  cudaMalloc(&d_grady1.data, grady1.ncols * grady1.nrows * sizeof(float));
-  cudaMalloc(&d_gradx2.data, gradx2.ncols * gradx2.nrows * sizeof(float));
-  cudaMalloc(&d_grady2.data, grady2.ncols * grady2.nrows * sizeof(float));
+	int i = tx - hw;
+	int j = ty - hh;
 
-  //copy to device
-  cudaMemcpy(d_gradx1.data, gradx1.data,  gradx1.ncols * gradx1.nrows * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_grady1.data, grady1.data, grady1.ncols * grady1.nrows * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_gradx2.data, gradx2.data, gradx2.ncols * gradx2.nrows * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_grady2.data, grady2.data, grady2.ncols * grady2.nrows * sizeof(float), cudaMemcpyHostToDevice);
+	float g1x = interpolate_cuda(x1 + i, y1 + j, gradx1, imgWidth, imgHeight);
+	float g2x = interpolate_cuda(x2 + i, y2 + j, gradx2, imgWidth, imgHeight);
+	gradx_out[ty * width + tx] = g1x + g2x;
 
-// --- Launch configuration ---
-//test config
-  dim3 blockDim(16, 16);
-  dim3 gridDim((width + blockDim.x - 1) / blockDim.x, (height + blockDim.y - 1) / blockDim.y);
-
-  // --- Launch kernel ---
-  _computeGradientSumKernel<<<gridDim, blockDim>>>( d_gradx1, d_grady1, d_gradx2, d_grady2,x1, y1, x2, y2, width, height, d_gradx_out, d_grady_out);
-
-  cudaDeviceSynchronize();
-  
-   // --- Copy results back to host ---
-  cudaMemcpy(gradx, d_gradx_out, windowSize, cudaMemcpyDeviceToHost);
-  cudaMemcpy(grady, d_grady_out, windowSize, cudaMemcpyDeviceToHost);
-
-  // --- Free device memory ---
-  cudaFree(d_gradx1.data);
-  cudaFree(d_grady1.data);
-  cudaFree(d_gradx2.data);
-  cudaFree(d_grady2.data);
-  cudaFree(d_gradx_out);
-  cudaFree(d_grady_out);
-
+	float g1y = interpolate_cuda(x1 + i, y1 + j, grady1, imgWidth, imgHeight);
+	float g2y = interpolate_cuda(x2 + i, y2 + j, grady2, imgWidth, imgHeight);
+	grady_out[ty * width + tx] = g1y + g2y;
 }
 
- 
 
+
+static void _computeGradientSum_cuda(
+	_KLT_FloatImage gradx1, _KLT_FloatImage grady1,
+	_KLT_FloatImage gradx2, _KLT_FloatImage grady2,
+	float x1, float y1,
+	float x2, float y2,
+	int width, int height,
+	_FloatWindow gradx, _FloatWindow grady)
+{
+	int imgWidth = gradx1->ncols;
+	int imgHeight = gradx1->nrows;
+
+	size_t imgBytes = imgWidth * imgHeight * sizeof(float);
+	size_t winBytes = width * height * sizeof(float);
+
+	float* d_gradx1, * d_grady1, * d_gradx2, * d_grady2;
+	float* d_gradx_out, * d_grady_out;
+
+	cudaMalloc(&d_gradx1, imgBytes);
+	cudaMalloc(&d_grady1, imgBytes);
+	cudaMalloc(&d_gradx2, imgBytes);
+	cudaMalloc(&d_grady2, imgBytes);
+	cudaMalloc(&d_gradx_out, winBytes);
+	cudaMalloc(&d_grady_out, winBytes);
+
+	cudaMemcpy(d_gradx1, gradx1->data, imgBytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_grady1, grady1->data, imgBytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_gradx2, gradx2->data, imgBytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_grady2, grady2->data, imgBytes, cudaMemcpyHostToDevice);
+
+	// Full parallel launch over the window
+	dim3 block(16, 16);
+	dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+	computeGradientSumKernel << <grid, block >> > (
+		d_gradx1, d_grady1, d_gradx2, d_grady2,
+		d_gradx_out, d_grady_out,
+		x1, y1, x2, y2,
+		width, height,
+		imgWidth, imgHeight
+		);
+	cudaDeviceSynchronize();
+
+	cudaMemcpy(gradx, d_gradx_out, winBytes, cudaMemcpyDeviceToHost);
+	cudaMemcpy(grady, d_grady_out, winBytes, cudaMemcpyDeviceToHost);
+
+	cudaFree(d_gradx1); cudaFree(d_grady1);
+	cudaFree(d_gradx2); cudaFree(d_grady2);
+	cudaFree(d_gradx_out); cudaFree(d_grady_out);
+}
 
 /*********************************************************************
  * _computeIntensityDifferenceLightingInsensitive
@@ -221,8 +368,8 @@ static void _computeIntensityDifferenceLightingInsensitive(
   /* Compute values */
   for (j = -hh ; j <= hh ; j++)
     for (i = -hw ; i <= hw ; i++)  {
-      g1 = _interpolate(x1+i, y1+j, img1);
-      g2 = _interpolate(x2+i, y2+j, img2);
+      g1 = interpolate_cuda(x1+i, y1+j, img1);
+      g2 = interpolate_cuda(x2+i, y2+j, img2);
       sum1 += g1;    sum2 += g2;
       sum1_squared += g1*g1;
       sum2_squared += g2*g2;
@@ -236,8 +383,8 @@ static void _computeIntensityDifferenceLightingInsensitive(
 
   for (j = -hh ; j <= hh ; j++)
     for (i = -hw ; i <= hw ; i++)  {
-      g1 = _interpolate(x1+i, y1+j, img1);
-      g2 = _interpolate(x2+i, y2+j, img2);
+      g1 = interpolate_cuda(x1+i, y1+j, img1);
+      g2 = interpolate_cuda(x2+i, y2+j, img2);
       *imgdiff++ = g1- g2*alpha-belta;
     } 
 }
@@ -273,8 +420,8 @@ static void _computeGradientSumLightingInsensitive(
   float mean1, mean2, alpha;
   for (j = -hh ; j <= hh ; j++)
     for (i = -hw ; i <= hw ; i++)  {
-      g1 = _interpolate(x1+i, y1+j, img1);
-      g2 = _interpolate(x2+i, y2+j, img2);
+      g1 = interpolate_cuda(x1+i, y1+j, img1);
+      g2 = interpolate_cuda(x2+i, y2+j, img2);
       sum1_squared += g1;    sum2_squared += g2;
     }
   mean1 = sum1_squared/(width*height);
@@ -284,11 +431,11 @@ static void _computeGradientSumLightingInsensitive(
   /* Compute values */
   for (j = -hh ; j <= hh ; j++)
     for (i = -hw ; i <= hw ; i++)  {
-      g1 = _interpolate(x1+i, y1+j, gradx1);
-      g2 = _interpolate(x2+i, y2+j, gradx2);
+      g1 = interpolate_cuda(x1+i, y1+j, gradx1);
+      g2 = interpolate_cuda(x2+i, y2+j, gradx2);
       *gradx++ = g1 + g2*alpha;
-      g1 = _interpolate(x1+i, y1+j, grady1);
-      g2 = _interpolate(x2+i, y2+j, grady2);
+      g1 = interpolate_cuda(x1+i, y1+j, grady1);
+      g2 = interpolate_cuda(x2+i, y2+j, grady2);
       *grady++ = g1+ g2*alpha;
     }  
 }
@@ -507,9 +654,9 @@ static int _trackFeature(
       _computeGradientSumLightingInsensitive(gradx1, grady1, gradx2, grady2, 
 			  img1, img2, x1, y1, *x2, *y2, width, height, gradx, grady);
     } else {
-      _computeIntensityDifference(img1, img2, x1, y1, *x2, *y2, 
+      _computeIntensityDifference_cuda(img1, img2, x1, y1, *x2, *y2, 
                                   width, height, imgdiff);
-      _computeGradientSum(gradx1, grady1, gradx2, grady2, 
+      _computeGradientSum_cuda(gradx1, grady1, gradx2, grady2, 
 			  x1, y1, *x2, *y2, width, height, gradx, grady);
     }
 		
@@ -541,7 +688,7 @@ static int _trackFeature(
       _computeIntensityDifferenceLightingInsensitive(img1, img2, x1, y1, *x2, *y2, 
                                   width, height, imgdiff);
     else
-      _computeIntensityDifference(img1, img2, x1, y1, *x2, *y2, 
+      _computeIntensityDifference_cuda(img1, img2, x1, y1, *x2, *y2, 
                                   width, height, imgdiff);
     if (_sumAbsFloatWindow(imgdiff, width, height)/(width*height) > max_residue) 
       status = KLT_LARGE_RESIDUE;
@@ -699,8 +846,8 @@ static void _am_getGradientWinAffine(
     for (i = -hw ; i <= hw ; i++)  {
       mi = Axx * i + Axy * j;
       mj = Ayx * i + Ayy * j;
-      *out_gradx++ = _interpolate(x+mi, y+mj, in_gradx);
-      *out_grady++ = _interpolate(x+mi, y+mj, in_grady);
+      *out_gradx++ = interpolate_cuda(x+mi, y+mj, in_gradx);
+      *out_grady++ = interpolate_cuda(x+mi, y+mj, in_grady);
     }
   
 }
@@ -727,7 +874,7 @@ static void _am_computeAffineMappedImage(
     for (i = -hw ; i <= hw ; i++)  {
       mi = Axx * i + Axy * j;
       mj = Ayx * i + Ayy * j;
-      *imgdiff++ = _interpolate(x+mi, y+mj, img);
+      *imgdiff++ = interpolate_cuda(x+mi, y+mj, img);
     }
 }
 
@@ -788,10 +935,10 @@ static void _am_computeIntensityDifferenceAffine(
   /* Compute values */
   for (j = -hh ; j <= hh ; j++)
     for (i = -hw ; i <= hw ; i++)  {
-      g1 = _interpolate(x1+i, y1+j, img1);
+      g1 = interpolate_cuda(x1+i, y1+j, img1);
       mi = Axx * i + Axy * j;
       mj = Ayx * i + Ayy * j;
-      g2 = _interpolate(x2+mi, y2+mj, img2);
+      g2 = interpolate_cuda(x2+mi, y2+mj, img2);
       *imgdiff++ = g1 - g2;
     }
 }
@@ -1101,9 +1248,9 @@ static int _am_trackFeatureAffine(
         _computeGradientSumLightingInsensitive(gradx1, grady1, gradx2, grady2, 
 			    img1, img2, x1, y1, *x2, *y2, width, height, gradx, grady);
       } else {
-        _computeIntensityDifference(img1, img2, x1, y1, *x2, *y2, 
+        _computeIntensityDifference_cuda(img1, img2, x1, y1, *x2, *y2, 
                                     width, height, imgdiff);
-        _computeGradientSum(gradx1, grady1, gradx2, grady2, 
+        _computeGradientSum_cuda(gradx1, grady1, gradx2, grady2, 
 			    x1, y1, *x2, *y2, width, height, gradx, grady);
       }
       
@@ -1268,7 +1415,7 @@ static int _am_trackFeatureAffine(
   /* Check whether residue is too large */
   if (status == KLT_TRACKED)  {
     if(!affine_map){
-      _computeIntensityDifference(img1, img2, x1, y1, *x2, *y2, 
+      _computeIntensityDifference_cuda(img1, img2, x1, y1, *x2, *y2, 
 				  width, height, imgdiff);
     }else{
       _am_computeIntensityDifferenceAffine(img1, img2, x1, y1, *x2, *y2,  *Axx, *Ayx , *Axy, *Ayy,
@@ -1601,6 +1748,5 @@ void KLTTrackFeatures(
 	}
 
 }
-
 
 
