@@ -59,10 +59,22 @@ help:
 # GPU version (default)
 all: gpu
 
-gpu: lib-gpu $(EXAMPLES:.c=-gpu)
+gpu: 
+	@echo "Starting GPU build at $(date '+%H:%M:%S')"
+	@start_time=$(date +%s); \
+	$(MAKE) lib-gpu $(EXAMPLES:.c=-gpu); \
+	end_time=$(date +%s); \
+	elapsed=$((end_time - start_time)); \
+	echo "GPU build completed in $elapsed seconds"
 
 # CPU version
-cpu: lib-cpu $(EXAMPLES:.c=-cpu)
+cpu:
+	@echo "Starting CPU build at $(date '+%H:%M:%S')"
+	@start_time=$(date +%s); \
+	$(MAKE) lib-cpu $(EXAMPLES:.c=-cpu); \
+	end_time=$(date +%s); \
+	elapsed=$((end_time - start_time)); \
+	echo "CPU build completed in $elapsed seconds"
 
 .c.o:
 	$(CC) -c $(CFLAGS) $<
@@ -90,9 +102,14 @@ example1-gpu: libklt-gpu.a
 
 example2-gpu: libklt-gpu.a
 	$(NVCC) -O3 $(NVCCFLAGS) -o example2 example2.c -L. -lklt-gpu $(LIB_GPU) -lm
-
+	
 example3-gpu: libklt-gpu.a
-	$(NVCC) -O3 $(NVCCFLAGS) -o example3 example3.c -L. -lklt-gpu $(LIB_GPU) -lm
+	@echo "Starting GPU build for example3 at $(shell date '+%H:%M:%S.%3N')"
+	@start_time=$$(date +%s.%3N); \
+	$(NVCC) -O3 $(NVCCFLAGS) -o example3 example3.c -L. -lklt-gpu $(LIB_GPU) -lm; \
+	end_time=$$(date +%s.%3N); \
+	elapsed=$$(echo "$$end_time - $$start_time" | bc); \
+	echo "GPU build for example3 completed in $$elapsed seconds"
 
 example4-gpu: libklt-gpu.a
 	$(NVCC) -O3 $(NVCCFLAGS) -o example4 example4.c -L. -lklt-gpu $(LIB_GPU) -lm
@@ -108,7 +125,12 @@ example2-cpu: libklt-cpu.a
 	$(CC) -O3 $(CFLAGS) -o example2 example2.c -L. -lklt-cpu $(LIB_CPU) -lm
 
 example3-cpu: libklt-cpu.a
-	$(CC) -O3 $(CFLAGS) -o example3 example3.c -L. -lklt-cpu $(LIB_CPU) -lm
+	@echo "Starting CPU build for example3 at $(shell date '+%H:%M:%S.%3N')"
+	@start_time=$$(date +%s.%3N); \
+	$(CC) -O3 $(CFLAGS) -o example3 example3.c -L. -lklt-cpu $(LIB_CPU) -lm; \
+	end_time=$$(date +%s.%3N); \
+	elapsed=$$(echo "$$end_time - $$start_time" | bc); \
+	echo "CPU build for example3 completed in $$elapsed seconds"
 
 example4-cpu: libklt-cpu.a
 	$(CC) -O3 $(CFLAGS) -o example4 example4.c -L. -lklt-cpu $(LIB_CPU) -lm
