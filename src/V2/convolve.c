@@ -23,14 +23,14 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort =
     }
 }
 
-
+*/
 #define MAX_KERNEL_WIDTH 	71
 
 typedef struct  {
   int width;
   float data[MAX_KERNEL_WIDTH];
 }  ConvolutionKernel;
-*/
+
 /* Kernels */
 static ConvolutionKernel gauss_kernel;
 static ConvolutionKernel gaussderiv_kernel;
