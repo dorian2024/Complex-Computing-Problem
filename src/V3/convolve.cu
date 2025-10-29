@@ -1,5 +1,5 @@
 /*********************************************************************
- * convolve.c
+ * convolve.cu
  *********************************************************************/
 
 /* Standard includes */
@@ -190,7 +190,73 @@ void _KLTGetKernelWidths(
 //    ptrrow += ncols;
 //  }
 //}
+//using shared memory
+__global__ void convolveImageHorizKernel_SM(
+    const float* imgin,
+    const float* kernel_data,
+    int kernel_width,
+    int ncols,
+    int nrows,
+    float* imgout)
+{
+    extern __shared__ float sdata[]; // shared memory for image row segment
 
+    int tx = threadIdx.x;             // thread column within block
+    int ty = threadIdx.y;             // thread row within block
+    int i  = blockIdx.x * blockDim.x + tx; // global column
+    int j  = blockIdx.y * blockDim.y + ty; // global row
+
+    if (j >= nrows) return;  // outside image vertically
+
+    int radius = kernel_width / 2;
+    int row_start = j * ncols;
+
+    // global index for this thread’s pixel
+    int global_idx = row_start + i;
+
+    // Shared memory tile width = blockDim.x + 2*radius
+    int tile_width = blockDim.x + 2 * radius;
+    int shared_idx = tx + radius; // position in shared memory
+
+    // 1. Load main tile (each thread loads one pixel)
+    if (i < ncols)
+        sdata[shared_idx] = imgin[global_idx];
+    else
+        sdata[shared_idx] = 0.0f;
+
+    // 2. Load left halo
+    if (tx < radius) {
+        int left_idx = i - radius;
+        sdata[tx] = (left_idx >= 0) ? imgin[row_start + left_idx] : 0.0f;
+    }
+
+    // 3. Load right halo
+    if (tx >= blockDim.x - radius) {
+        int right_idx = i + radius;
+        int s_right = shared_idx + radius;
+        if (s_right < tile_width)
+            sdata[s_right] = (right_idx < ncols) ? imgin[row_start + right_idx] : 0.0f;
+    }
+
+    __syncthreads();  // wait for all threads to fill the tile
+
+    // 4. Now perform convolution using shared memory
+    if (i < radius || i >= ncols - radius) {
+        if (i < ncols)
+            imgout[global_idx] = 0.0f; // boundary handling
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int k = 0; k < kernel_width; k++) {
+        sum += sdata[shared_idx - radius + k] * kernel_data[k];
+    }
+
+    imgout[global_idx] = sum;
+}
+
+
+// version of kernel not using shared mem
 __global__ void convolveImageHorizKernel(
     const float* imgin,
     const float* kernel_data,
@@ -232,6 +298,9 @@ __global__ void convolveImageHorizKernel(
     imgout[out_idx] = sum;
 }
 
+
+
+
 // CUDA version of _convolveImageHoriz
 static void _convolveImageHoriz_cuda(
     _KLT_FloatImage imgin,
@@ -254,11 +323,11 @@ static void _convolveImageHoriz_cuda(
     cudaMemcpy(d_kernel, kernel.data, kernel_size, cudaMemcpyHostToDevice);
 
     // Configure and launch kernel
-    dim3 blockDim(32,32);
+    dim3 blockDim(16, 16);
     dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
         (nrows + blockDim.y - 1) / blockDim.y);
 
-    convolveImageHorizKernel <<<gridDim, blockDim >> > (
+    convolveImageHorizKernel << <gridDim, blockDim >> > (
         d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
 
     // Copy result back to host
@@ -329,6 +398,79 @@ static void _convolveImageHoriz_cuda(
 //  }
 //}
 
+//cuda kernel with SM 
+__global__ void convolveImageVertKernel_SM(
+    const float* imgin,
+    const float* kernel_data,
+    int kernel_width,
+    int ncols,
+    int nrows,
+    float* imgout)
+{
+    // Shared memory tile for a column segment
+    extern __shared__ float sdata[];
+
+    int tx = threadIdx.x;  // column index within block
+    int ty = threadIdx.y;  // row index within block
+
+    int i = blockIdx.x * blockDim.x + tx; // global column
+    int j = blockIdx.y * blockDim.y + ty; // global row
+
+    if (i >= ncols) return; // out of horizontal bounds
+
+    int radius = kernel_width / 2;
+    int tile_height = blockDim.y + 2 * radius;
+
+    // Each thread copies one pixel from global memory to shared memory
+    // Compute global and shared indices
+    int global_idx = j * ncols + i;
+    int shared_idx = ty + radius; // vertical offset in shared memory
+
+    // 1️⃣ Load main tile pixels
+    if (j < nrows)
+        sdata[shared_idx * blockDim.x + tx] = imgin[global_idx];
+    else
+        sdata[shared_idx * blockDim.x + tx] = 0.0f;
+
+    // 2️⃣ Load top halo
+    if (ty < radius) {
+        int top_j = j - radius;
+        int top_shared = ty;
+        sdata[top_shared * blockDim.x + tx] = (top_j >= 0)
+            ? imgin[top_j * ncols + i]
+            : 0.0f;
+    }
+
+    // 3️⃣ Load bottom halo
+    if (ty >= blockDim.y - radius) {
+        int bottom_j = j + radius;
+        int bottom_shared = shared_idx + radius;
+        if (bottom_shared < tile_height)
+            sdata[bottom_shared * blockDim.x + tx] = (bottom_j < nrows)
+                ? imgin[bottom_j * ncols + i]
+                : 0.0f;
+    }
+
+    __syncthreads();
+
+    // 4️⃣ Handle image borders
+    if (j < radius || j >= nrows - radius) {
+        if (i < ncols)
+            imgout[global_idx] = 0.0f;
+        return;
+    }
+
+    // 5️⃣ Convolve vertically using shared memory
+    float sum = 0.0f;
+    for (int k = 0; k < kernel_width; k++) {
+        int s_row = shared_idx - radius + k;
+        sum += sdata[s_row * blockDim.x + tx] * kernel_data[k];
+    }
+
+    imgout[global_idx] = sum;
+}
+
+//cuda kernel without SM 
 // CUDA kernel for vertical convolution
 __global__ void convolveImageVertKernel(
     const float* imgin,
@@ -392,11 +534,11 @@ static void _convolveImageVert_cuda(
     cudaMemcpy(d_kernel, kernel.data, kernel_size, cudaMemcpyHostToDevice);
 
     // Configure and launch kernel
-    dim3 blockDim(32,32);
+    dim3 blockDim(16, 16);
     dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
         (nrows + blockDim.y - 1) / blockDim.y);
 
-    convolveImageVertKernel << <gridDim, blockDim >> > (
+    convolveImageVertKernel_SM << <gridDim, blockDim >> > (
         d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
 
     // Copy result back to host
@@ -478,6 +620,4 @@ void _KLTComputeSmoothedImage(
 
   _convolveSeparate(img, gauss_kernel, gauss_kernel, smooth);
 }
-
-
 
