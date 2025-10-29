@@ -1,5 +1,5 @@
 /*********************************************************************
- * trackFeatures.c
+ * trackFeatures.cu
  *
  *********************************************************************/
 
@@ -269,6 +269,103 @@ __global__ void computeGradientSumKernel(
 }
 
 
+//with SM 
+__global__ void computeGradientSumKernel_SM(
+    const float* gradx1, const float* grady1,
+    const float* gradx2, const float* grady2,
+    float* gradx_out, float* grady_out,
+    float x1, float y1, float x2, float y2,
+    int width, int height,
+    int imgWidth, int imgHeight)
+{
+    extern __shared__ float sharedMem[];
+
+    // Divide shared memory into 4 tiles (one for each gradient input)
+    int tileSize = (blockDim.x + 1) * (blockDim.y + 1);
+    float* tile_gradx1 = sharedMem;
+    float* tile_grady1 = sharedMem + tileSize;
+    float* tile_gradx2 = sharedMem + 2 * tileSize;
+    float* tile_grady2 = sharedMem + 3 * tileSize;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int bx = blockIdx.x * blockDim.x;
+    int by = blockIdx.y * blockDim.y;
+
+    int tx_global = bx + tx;
+    int ty_global = by + ty;
+
+    if (tx_global >= width || ty_global >= height)
+        return;
+
+    int hw = width / 2;
+    int hh = height / 2;
+
+    int i = tx_global - hw;
+    int j = ty_global - hh;
+
+    int tileW = blockDim.x + 1;
+    int tileH = blockDim.y + 1;
+
+    // --- Load gradient data into shared memory ---
+    if (tx_global < imgWidth && ty_global < imgHeight) {
+        int idx = ty * tileW + tx;
+        int imgIdx = ty_global * imgWidth + tx_global;
+
+        tile_gradx1[idx] = gradx1[imgIdx];
+        tile_grady1[idx] = grady1[imgIdx];
+        tile_gradx2[idx] = gradx2[imgIdx];
+        tile_grady2[idx] = grady2[imgIdx];
+    }
+
+    __syncthreads();
+
+    // --- Local inline interpolation lambda ---
+    auto interpolate_SM = [&](float x, float y, const float* img, const float* tile) {
+        int xt = (int)x;
+        int yt = (int)y;
+        float ax = x - xt;
+        float ay = y - yt;
+
+        if (xt < 0 || yt < 0 || xt >= imgWidth - 1 || yt >= imgHeight - 1)
+            return 0.0f;
+
+        int local_x = xt - bx;
+        int local_y = yt - by;
+
+        float v00, v10, v01, v11;
+
+        if (local_x >= 0 && local_x + 1 < tileW &&
+            local_y >= 0 && local_y + 1 < tileH) {
+            v00 = tile[local_y * tileW + local_x];
+            v10 = tile[local_y * tileW + local_x + 1];
+            v01 = tile[(local_y + 1) * tileW + local_x];
+            v11 = tile[(local_y + 1) * tileW + local_x + 1];
+        } else {
+            const float* ptr = img + yt * imgWidth + xt;
+            v00 = ptr[0];
+            v10 = ptr[1];
+            v01 = ptr[imgWidth];
+            v11 = ptr[imgWidth + 1];
+        }
+
+        return (1 - ax) * (1 - ay) * v00 +
+               ax * (1 - ay) * v10 +
+               (1 - ax) * ay * v01 +
+               ax * ay * v11;
+    };
+
+    // --- Compute interpolations using shared memory ---
+    float g1x = interpolate_SM(x1 + i, y1 + j, gradx1, tile_gradx1);
+    float g2x = interpolate_SM(x2 + i, y2 + j, gradx2, tile_gradx2);
+    gradx_out[ty_global * width + tx_global] = g1x + g2x;
+
+    float g1y = interpolate_SM(x1 + i, y1 + j, grady1, tile_grady1);
+    float g2y = interpolate_SM(x2 + i, y2 + j, grady2, tile_grady2);
+    grady_out[ty_global * width + tx_global] = g1y + g2y;
+}
+
+
 
 static void _computeGradientSum_cuda(
 	_KLT_FloatImage gradx1, _KLT_FloatImage grady1,
@@ -303,7 +400,7 @@ static void _computeGradientSum_cuda(
 	dim3 block(32,32);
 	dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
 
-	computeGradientSumKernel << <grid, block >> > (
+	computeGradientSumKernel_SM << <grid, block >> > (
 		d_gradx1, d_grady1, d_gradx2, d_grady2,
 		d_gradx_out, d_grady_out,
 		x1, y1, x2, y2,
@@ -459,7 +556,75 @@ static void _compute2by1ErrorVector(
   int width,   /* size of window */
   int height,
   float step_factor, /* 2.0 comes from equations, 1.0 seems to avoid overshooting */
-  float *ex,   /* return values */
+  float *ex,   /* return values *//*********************************************************************
+ * trackFeatures.c
+ *
+ *********************************************************************/
+
+/* Standard includes */
+#include <assert.h>
+#include <math.h>		/* fabs() */
+#include <stdlib.h>		/* malloc() */
+#include <stdio.h>		/* fflush() */
+
+/* Our includes */
+#include "base.h"
+#include "error.h"
+#include "convolve.h"	/* for computing pyramid */
+#include "klt.h"
+#include "klt_util.h"	/* _KLT_FloatImage */
+#include "pyramid.h"	/* _KLT_Pyramid */
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+#define cudaCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+	if (code != cudaSuccess) {
+		fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(code), file, line);
+		if (abort) exit(code);
+	}
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern int KLT_verbose;
+
+#ifdef __cplusplus
+}
+#endif
+
+
+typedef float *_FloatWindow;
+
+/*********************************************************************
+ * interpolate_cuda
+ * 
+ * Given a point (x,y) in an image, computes the bilinear interpolated 
+ * gray-level value of the point in the image.  
+ */
+
+static float interpolate_cuda(
+  float x, 
+  float y, 
+  _KLT_FloatImage img)
+{
+  int xt = (int) x;  /* coordinates of top-left corner */
+  int yt = (int) y;
+  float ax = x - xt;
+  float ay = y - yt;
+  float *ptr = img->data + (img->ncols*yt) + xt;
+
+#ifndef _DNDEBUG
+  if (xt<0 || yt<0 || xt>=img->ncols-1 || yt>=img->nrows-1) {
+    fprintf(stderr, "(xt,yt)=(%d,%d)  imgsize=(%d,%d)\n"
+            "(x,y)=(%f,%f)  (ax,ay)=(%f,%f)\n",
+            xt, yt, img->ncols, img->nrows, x, y, ax, ay);
+
   float *ey)
 {
   register float diff;
@@ -1725,5 +1890,4 @@ void KLTTrackFeatures(
 	}
 
 }
-
 
