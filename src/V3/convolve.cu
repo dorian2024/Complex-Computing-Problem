@@ -305,7 +305,8 @@ __global__ void convolveImageHorizKernel(
 static void _convolveImageHoriz_cuda(
     _KLT_FloatImage imgin,
     ConvolutionKernel kernel,
-    _KLT_FloatImage imgout)
+    _KLT_FloatImage imgout, 
+    cudaStream_t stream)
 {
     int ncols = imgin->ncols;
     int nrows = imgin->nrows;
@@ -327,7 +328,7 @@ static void _convolveImageHoriz_cuda(
     dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
         (nrows + blockDim.y - 1) / blockDim.y);
 
-    convolveImageHorizKernel << <gridDim, blockDim >> > (
+    convolveImageHorizKernel_SM << <gridDim, blockDim, 0, stream >> > (
         d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
 
     // Copy result back to host
@@ -516,7 +517,8 @@ __global__ void convolveImageVertKernel(
 static void _convolveImageVert_cuda(
     _KLT_FloatImage imgin,
     ConvolutionKernel kernel,
-    _KLT_FloatImage imgout)
+    _KLT_FloatImage imgout, 
+    cudaStream_t stream)
 {
     int ncols = imgin->ncols;
     int nrows = imgin->nrows;
@@ -538,7 +540,7 @@ static void _convolveImageVert_cuda(
     dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
         (nrows + blockDim.y - 1) / blockDim.y);
 
-    convolveImageVertKernel_SM << <gridDim, blockDim >> > (
+    convolveImageVertKernel_SM<< <gridDim, blockDim, 0, stream>> > (
         d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
 
     // Copy result back to host
@@ -573,7 +575,23 @@ static void _convolveSeparate(
     _KLTFreeFloatImage(tmpimg);
 }
 
-	
+//use a stream 
+static void _convolveSeparate_cuda(
+    _KLT_FloatImage imgin,
+    ConvolutionKernel horiz_kernel,
+    ConvolutionKernel vert_kernel,
+    _KLT_FloatImage imgout,
+    cudaStream_t stream)
+{
+    _KLT_FloatImage tmpimg = _KLTCreateFloatImage(imgin->ncols, imgin->nrows);
+
+    _convolveImageHoriz_cuda(imgin, horiz_kernel, tmpimg, stream);
+    _convolveImageVert_cuda(tmpimg, vert_kernel, imgout, stream);
+
+    _KLTFreeFloatImage(tmpimg);
+}
+
+
 /*********************************************************************
  * _KLTComputeGradients
  */
@@ -600,6 +618,40 @@ void _KLTComputeGradients(
 
 }
 	
+//use streaming 
+void _KLTComputeGradients(
+  _KLT_FloatImage img,
+  float sigma,
+  _KLT_FloatImage gradx,
+  _KLT_FloatImage grady)
+{
+  assert(gradx->ncols >= img->ncols);
+  assert(gradx->nrows >= img->nrows);
+  assert(grady->ncols >= img->ncols);
+  assert(grady->nrows >= img->nrows);
+
+  if (fabs(sigma - sigma_last) > 0.05)
+    _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
+
+  // Create two CUDA streams
+  cudaStream_t streamX, streamY;
+  cudaStreamCreate(&streamX);
+  cudaStreamCreate(&streamY);
+
+  // Launch both convolutions in parallel streams
+  _convolveSeparate_cuda(img, gaussderiv_kernel, gauss_kernel, gradx, streamX);
+  _convolveSeparate_cuda(img, gauss_kernel, gaussderiv_kernel, grady, streamY);
+
+  // Wait for both to finish
+  cudaStreamSynchronize(streamX);
+  cudaStreamSynchronize(streamY);
+
+  // Cleanup
+  cudaStreamDestroy(streamX);
+  cudaStreamDestroy(streamY);
+}
+
+
 
 /*********************************************************************
  * _KLTComputeSmoothedImage
@@ -620,4 +672,5 @@ void _KLTComputeSmoothedImage(
 
   _convolveSeparate(img, gauss_kernel, gauss_kernel, smooth);
 }
+
 

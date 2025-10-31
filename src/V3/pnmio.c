@@ -10,15 +10,7 @@
 #include <stdlib.h>  /* malloc(), atoi() */
 
 /* Our includes */
-//#include "error.h"
-#ifdef __cplusplus
-extern "C" {
-    #include "pnmio.h"
-    #include "error.h"
-    #include "klt_util.h"
-    #include "klt.h"
-}
-#endif 
+#include "error.h"
 
 #define LENGTH 80
 

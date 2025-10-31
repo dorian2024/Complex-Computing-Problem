@@ -22,4 +22,3 @@ void KLTWarning(char *fmt, ...);
 
 
 #endif
-

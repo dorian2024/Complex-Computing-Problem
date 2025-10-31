@@ -5,14 +5,11 @@
 #ifndef _PYRAMID_H_
 #define _PYRAMID_H_
 
-#include "klt_util.h"
-
-
 #ifdef __cplusplus
+extern "C" {
 
-extern "C"
-{
 #endif
+#include "klt_util.h"
 
 typedef struct  {
   int subsampling;
@@ -37,7 +34,7 @@ void _KLTFreePyramid(
   _KLT_Pyramid pyramid);
 
 #endif
-
 #ifdef __cplusplus
 }
+
 #endif
