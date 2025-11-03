@@ -12,6 +12,46 @@
 #include "error.h"
 #include "convolve.h"
 #include "klt_util.h"   /* printing */
+#include "klt.h"
+
+// Pool for convolution operations
+typedef struct {
+    float* d_imgin;
+    float* d_imgout;
+    float* d_tmpimg;
+    float* d_kernel;
+
+    // Batch processing buffers
+    float** d_batch_inputs;
+    float** d_batch_temps;
+    float** d_batch_outputs;
+    float** h_batch_inputs;
+    float** h_batch_temps;
+    float** h_batch_outputs;
+
+    // Prefetch buffers
+    float* d_prefetch_buffer[2];
+    int prefetch_buffer_size;
+    int current_prefetch;
+
+    size_t img_capacity;
+    size_t batch_capacity;
+    int max_batch_size;
+    bool initialized;
+    bool batch_initialized;
+} ConvolutionPool;
+
+static ConvolutionPool g_conv_pool = {
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    {NULL, NULL}, 0, 0,
+    0, 0, 0, false, false
+};
+
+// Pool for kernel data (persistent across calls)
+static float* d_gauss_kernel_data = NULL;
+static float* d_gaussderiv_kernel_data = NULL;
+static bool kernels_on_device = false;
 
 #define cudaCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
@@ -22,8 +62,98 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort =
     }
 }
 
+#define CONVOLUTION_BLOCK_SIZE 32
+#define GRADIENT_BLOCK_SIZE 16
+#define PREFETCH_ENABLED 1
+#define USE_PINNED_MEMORY 1
+#define MAX_CONCURRENT_STREAMS 4
 
-#define MAX_KERNEL_WIDTH 	71
+// Dynamic shared memory calculator
+inline size_t calculateSharedMemory(int blockDim, int kernelWidth) {
+    return (blockDim * blockDim + kernelWidth) * sizeof(float);
+}
+
+void _KLTInitBatchConvolution(int max_batch_size) {
+    if (g_conv_pool.batch_initialized) return;
+
+    g_conv_pool.max_batch_size = max_batch_size;
+
+    // Allocate host arrays for batch pointers
+    g_conv_pool.h_batch_inputs = (float**)malloc(max_batch_size * sizeof(float*));
+    g_conv_pool.h_batch_temps = (float**)malloc(max_batch_size * sizeof(float*));
+    g_conv_pool.h_batch_outputs = (float**)malloc(max_batch_size * sizeof(float*));
+
+    // Allocate device arrays for batch pointers
+    cudaCheck(cudaMalloc(&g_conv_pool.d_batch_inputs,
+        max_batch_size * sizeof(float*)));
+    cudaCheck(cudaMalloc(&g_conv_pool.d_batch_temps,
+        max_batch_size * sizeof(float*)));
+    cudaCheck(cudaMalloc(&g_conv_pool.d_batch_outputs,
+        max_batch_size * sizeof(float*)));
+
+    g_conv_pool.batch_initialized = true;
+}
+
+void _KLTCleanupBatchConvolution(void) {
+    if (g_conv_pool.batch_initialized) {
+        cudaFree(g_conv_pool.d_batch_inputs);
+        cudaFree(g_conv_pool.d_batch_temps);
+        cudaFree(g_conv_pool.d_batch_outputs);
+
+        free(g_conv_pool.h_batch_inputs);
+        free(g_conv_pool.h_batch_temps);
+        free(g_conv_pool.h_batch_outputs);
+
+        g_conv_pool.batch_initialized = false;
+    }
+
+    // Cleanup prefetch buffers
+    for (int i = 0; i < 2; i++) {
+        if (g_conv_pool.d_prefetch_buffer[i]) {
+            cudaFree(g_conv_pool.d_prefetch_buffer[i]);
+            g_conv_pool.d_prefetch_buffer[i] = NULL;
+        }
+    }
+}
+
+void _KLTCleanupConvolveCUDA(void) {
+    // Free convolution pool
+    if (g_conv_pool.initialized) {
+        cudaFree(g_conv_pool.d_imgin);
+        cudaFree(g_conv_pool.d_imgout);
+        cudaFree(g_conv_pool.d_tmpimg);
+        cudaFree(g_conv_pool.d_kernel);
+        g_conv_pool.initialized = false;
+        g_conv_pool.img_capacity = 0;
+    }
+
+    // Free persistent kernel data
+    if (kernels_on_device) {
+        cudaFree(d_gauss_kernel_data);
+        cudaFree(d_gaussderiv_kernel_data);
+        kernels_on_device = false;
+    }
+
+    // Free batch resources
+    _KLTCleanupBatchConvolution();
+}
+
+// Add this function to convolve.cu
+static cudaStream_t _getStream(int index) {
+    static cudaStream_t streams[4] = { 0 };
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < 4; i++) {
+            cudaCheck(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
+        }
+        initialized = true;
+    }
+
+    return streams[index % 4];
+}
+
+#define MAX_KERNEL_WIDTH 71
 
 typedef struct  {
   int width;
@@ -43,22 +173,25 @@ static float sigma_last = -10.0;
  * data to a float image.
  */
 
+ /*********************************************************************
+  * _KLTToFloatImage - OPTIMIZED with parallel CPU conversion
+  */
 void _KLTToFloatImage(
-  KLT_PixelType *img,
-  int ncols, int nrows,
-  _KLT_FloatImage floatimg)
+    KLT_PixelType* img,
+    int ncols, int nrows,
+    _KLT_FloatImage floatimg)
 {
-  KLT_PixelType *ptrend = img + ncols*nrows;
-  float *ptrout = floatimg->data;
+    assert(floatimg->ncols >= ncols);
+    assert(floatimg->nrows >= nrows);
 
-  /* Output image must be large enough to hold result */
-  assert(floatimg->ncols >= ncols);
-  assert(floatimg->nrows >= nrows);
+    floatimg->ncols = ncols;
+    floatimg->nrows = nrows;
 
-  floatimg->ncols = ncols;
-  floatimg->nrows = nrows;
+    int total = ncols * nrows;
 
-  while (img < ptrend)  *ptrout++ = (float) *img++;
+    for (int i = 0; i < total; i++) {
+        floatimg->data[i] = (float)img[i];
+    }
 }
 
 
@@ -138,59 +271,9 @@ void _KLTGetKernelWidths(
   *gaussderiv_width = gaussderiv_kernel.width;
 }
 
-
 /*********************************************************************
- * _convolveImageHoriz
+ * _convolveImageHoriz with Shared Memory - MATCHES NAIVE BEHAVIOR
  */
-
-//this function it blurs or filters the image along the x-direction (left to right) using a 1D kernel.
-//static void _convolveImageHoriz(
-//  _KLT_FloatImage imgin, 
-//  ConvolutionKernel kernel,
-//  _KLT_FloatImage imgout)
-//{
-//  float *ptrrow = imgin->data;           /* Points to row's first pixel */
-//  register float *ptrout = imgout->data, /* Points to next output pixel */
-//    *ppp;
-//  register float sum;
-//  register int radius = kernel.width / 2;
-//  register int ncols = imgin->ncols, nrows = imgin->nrows;
-//  register int i, j, k;
-//
-//  /* Kernel width must be odd */
-//  assert(kernel.width % 2 == 1);
-//
-//  /* Must read from and write to different images */
-//  assert(imgin != imgout);
-//
-//  /* Output image must be large enough to hold result */
-//  assert(imgout->ncols >= imgin->ncols);
-//  assert(imgout->nrows >= imgin->nrows);
-//
-//  /* For each row, do ... */
-//  for (j = 0 ; j < nrows ; j++)  {
-//
-//    /* Zero leftmost columns */
-//    for (i = 0 ; i < radius ; i++)
-//      *ptrout++ = 0.0;
-//
-//    /* Convolve middle columns with kernel */
-//    for ( ; i < ncols - radius ; i++)  {
-//      ppp = ptrrow + i - radius;
-//      sum = 0.0;
-//      for (k = kernel.width-1 ; k >= 0 ; k--)
-//        sum += *ppp++ * kernel.data[k];
-//      *ptrout++ = sum;
-//    }
-//
-//    /* Zero rightmost columns */
-//    for ( ; i < ncols ; i++)
-//      *ptrout++ = 0.0;
-//
-//    ptrrow += ncols;
-//  }
-//}
-//using shared memory
 __global__ void convolveImageHorizKernel_SM(
     const float* imgin,
     const float* kernel_data,
@@ -199,207 +282,67 @@ __global__ void convolveImageHorizKernel_SM(
     int nrows,
     float* imgout)
 {
-    extern __shared__ float sdata[]; // shared memory for image row segment
+    extern __shared__ float shared_data[];
 
-    int tx = threadIdx.x;             // thread column within block
-    int ty = threadIdx.y;             // thread row within block
-    int i  = blockIdx.x * blockDim.x + tx; // global column
-    int j  = blockIdx.y * blockDim.y + ty; // global row
+    // Shared memory layout: [tile_data][kernel_data]
+    float* sdata = shared_data;
+    float* skernel = shared_data + blockDim.x * blockDim.y;
 
-    if (j >= nrows) return;  // outside image vertically
-
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
     int radius = kernel_width / 2;
-    int row_start = j * ncols;
 
-    // global index for this thread’s pixel
-    int global_idx = row_start + i;
-
-    // Shared memory tile width = blockDim.x + 2*radius
-    int tile_width = blockDim.x + 2 * radius;
-    int shared_idx = tx + radius; // position in shared memory
-
-    // 1. Load main tile (each thread loads one pixel)
-    if (i < ncols)
-        sdata[shared_idx] = imgin[global_idx];
-    else
-        sdata[shared_idx] = 0.0f;
-
-    // 2. Load left halo
-    if (tx < radius) {
-        int left_idx = i - radius;
-        sdata[tx] = (left_idx >= 0) ? imgin[row_start + left_idx] : 0.0f;
+    // Cooperative kernel loading (once per block)
+    if (ty == 0 && tx < kernel_width) {
+        skernel[tx] = kernel_data[tx];
     }
 
-    // 3. Load right halo
-    if (tx >= blockDim.x - radius) {
-        int right_idx = i + radius;
-        int s_right = shared_idx + radius;
-        if (s_right < tile_width)
-            sdata[s_right] = (right_idx < ncols) ? imgin[row_start + right_idx] : 0.0f;
+    // Global position accounting for radius offset
+    int col = blockIdx.x * (blockDim.x - 2 * radius) + tx - radius;
+    int row = blockIdx.y * (blockDim.y - 2 * radius) + ty - radius;
+
+    // Coalesced load into shared memory
+    if (row >= 0 && row < nrows && col >= 0 && col < ncols) {
+        sdata[ty * blockDim.x + tx] = imgin[row * ncols + col];
+    }
+    else {
+        sdata[ty * blockDim.x + tx] = 0.0f;
     }
 
-    __syncthreads();  // wait for all threads to fill the tile
+    __syncthreads();
 
-    // 4. Now perform convolution using shared memory
-    if (i < radius || i >= ncols - radius) {
-        if (i < ncols)
-            imgout[global_idx] = 0.0f; // boundary handling
-        return;
+    // Tile coordinates
+    int tileCol = tx - radius;
+    int tileRow = ty - radius;
+
+    // Compute output for valid threads
+    if (tileCol >= 0 && tileCol < blockDim.x - 2 * radius &&
+        tileRow >= 0 && tileRow < blockDim.y - 2 * radius) {
+
+        if (col >= 0 && col < ncols && row >= 0 && row < nrows) {
+
+            // Zero out leftmost and rightmost columns
+            if (col < radius || col >= ncols - radius) {
+                imgout[row * ncols + col] = 0.0f;
+                return;
+            }
+
+            // Optimized convolution with unrolling hint
+            float sum = 0.0f;
+#pragma unroll 8
+            for (int k = 0; k < kernel_width; k++) {
+                int sharedCol = tileCol + k;
+                sum += sdata[ty * blockDim.x + sharedCol] * skernel[kernel_width - 1 - k];
+            }
+
+            imgout[row * ncols + col] = sum;
+        }
     }
-
-    float sum = 0.0f;
-    for (int k = 0; k < kernel_width; k++) {
-        sum += sdata[shared_idx - radius + k] * kernel_data[k];
-    }
-
-    imgout[global_idx] = sum;
-}
-
-
-// version of kernel not using shared mem
-__global__ void convolveImageHorizKernel(
-    const float* imgin,
-    const float* kernel_data,
-    int kernel_width,
-    int ncols,
-    int nrows,
-    float* imgout)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;  // column index
-    int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
-
-    if (i >= ncols || j >= nrows)
-        return;
-
-    int radius = kernel_width / 2;
-    int out_idx = j * ncols + i;
-
-    // Zero leftmost columns
-    if (i < radius) {
-        imgout[out_idx] = 0.0f;
-        return;
-    }
-
-    // Zero rightmost columns
-    if (i >= ncols - radius) {
-        imgout[out_idx] = 0.0f;
-        return;
-    }
-
-    // Convolve middle columns with kernel
-    float sum = 0.0f;
-    int row_start = j * ncols;
-
-    for (int k = kernel_width - 1; k >= 0; k--) {
-        int ppp_idx = row_start + i - radius + (kernel_width - 1 - k);
-        sum += imgin[ppp_idx] * kernel_data[k];
-    }
-
-    imgout[out_idx] = sum;
-}
-
-
-
-
-// CUDA version of _convolveImageHoriz
-static void _convolveImageHoriz_cuda(
-    _KLT_FloatImage imgin,
-    ConvolutionKernel kernel,
-    _KLT_FloatImage imgout, 
-    cudaStream_t stream)
-{
-    int ncols = imgin->ncols;
-    int nrows = imgin->nrows;
-    size_t img_size = ncols * nrows * sizeof(float);
-    size_t kernel_size = kernel.width * sizeof(float);
-
-    // Allocate device memory
-    float* d_imgin, * d_imgout, * d_kernel;
-    cudaMalloc(&d_imgin, img_size);
-    cudaMalloc(&d_imgout, img_size);
-    cudaMalloc(&d_kernel, kernel_size);
-
-    // Copy data to device
-    cudaMemcpy(d_imgin, imgin->data, img_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kernel, kernel.data, kernel_size, cudaMemcpyHostToDevice);
-
-    // Configure and launch kernel
-    dim3 blockDim(16, 16);
-    dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
-        (nrows + blockDim.y - 1) / blockDim.y);
-
-    convolveImageHorizKernel_SM << <gridDim, blockDim, 0, stream >> > (
-        d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
-
-    // Copy result back to host
-    cudaMemcpy(imgout->data, d_imgout, img_size, cudaMemcpyDeviceToHost);
-
-    // Free device memory
-    cudaFree(d_imgin);
-    cudaFree(d_imgout);
-    cudaFree(d_kernel);
 }
 
 /*********************************************************************
- * _convolveImageVert
+ * _convolveImageVert with Shared Memory - MATCHES NAIVE BEHAVIOR
  */
-
-//static void _convolveImageVert(
-//  _KLT_FloatImage imgin,
-//  ConvolutionKernel kernel,
-//  _KLT_FloatImage imgout)
-//{
-//  float *ptrcol = imgin->data;            /* Points to row's first pixel */
-//  register float *ptrout = imgout->data,  /* Points to next output pixel */
-//    *ppp;
-//  register float sum;
-//  register int radius = kernel.width / 2;
-//  register int ncols = imgin->ncols, nrows = imgin->nrows;
-//  register int i, j, k;
-//
-//  /* Kernel width must be odd */
-//  assert(kernel.width % 2 == 1);
-//
-//  /* Must read from and write to different images */
-//  assert(imgin != imgout);
-//
-//  /* Output image must be large enough to hold result */
-//  assert(imgout->ncols >= imgin->ncols);
-//  assert(imgout->nrows >= imgin->nrows);
-//
-//  /* For each column, do ... */
-//  for (i = 0 ; i < ncols ; i++)  {
-//
-//    /* Zero topmost rows */
-//    for (j = 0 ; j < radius ; j++)  {
-//      *ptrout = 0.0;
-//      ptrout += ncols;
-//    }
-//
-//    /* Convolve middle rows with kernel */
-//    for ( ; j < nrows - radius ; j++)  {
-//      ppp = ptrcol + ncols * (j - radius);
-//      sum = 0.0;
-//      for (k = kernel.width-1 ; k >= 0 ; k--)  {
-//        sum += *ppp * kernel.data[k];
-//        ppp += ncols;
-//      }
-//      *ptrout = sum;
-//      ptrout += ncols;
-//    }
-//
-//    /* Zero bottommost rows */
-//    for ( ; j < nrows ; j++)  {
-//      *ptrout = 0.0;
-//      ptrout += ncols;
-//    }
-//
-//    ptrcol++;
-//    ptrout -= nrows * ncols - 1;
-//  }
-//}
-
-//cuda kernel with SM 
 __global__ void convolveImageVertKernel_SM(
     const float* imgin,
     const float* kernel_data,
@@ -408,174 +351,67 @@ __global__ void convolveImageVertKernel_SM(
     int nrows,
     float* imgout)
 {
-    // Shared memory tile for a column segment
-    extern __shared__ float sdata[];
+    extern __shared__ float shared_data[];
 
-    int tx = threadIdx.x;  // column index within block
-    int ty = threadIdx.y;  // row index within block
+    // Shared memory layout: [tile_data][kernel_data]
+    float* sdata = shared_data;
+    float* skernel = shared_data + blockDim.x * blockDim.y;
 
-    int i = blockIdx.x * blockDim.x + tx; // global column
-    int j = blockIdx.y * blockDim.y + ty; // global row
-
-    if (i >= ncols) return; // out of horizontal bounds
-
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
     int radius = kernel_width / 2;
-    int tile_height = blockDim.y + 2 * radius;
 
-    // Each thread copies one pixel from global memory to shared memory
-    // Compute global and shared indices
-    int global_idx = j * ncols + i;
-    int shared_idx = ty + radius; // vertical offset in shared memory
-
-    // 1️⃣ Load main tile pixels
-    if (j < nrows)
-        sdata[shared_idx * blockDim.x + tx] = imgin[global_idx];
-    else
-        sdata[shared_idx * blockDim.x + tx] = 0.0f;
-
-    // 2️⃣ Load top halo
-    if (ty < radius) {
-        int top_j = j - radius;
-        int top_shared = ty;
-        sdata[top_shared * blockDim.x + tx] = (top_j >= 0)
-            ? imgin[top_j * ncols + i]
-            : 0.0f;
+    // Cooperative kernel loading
+    if (ty == 0 && tx < kernel_width) {
+        skernel[tx] = kernel_data[tx];
     }
 
-    // 3️⃣ Load bottom halo
-    if (ty >= blockDim.y - radius) {
-        int bottom_j = j + radius;
-        int bottom_shared = shared_idx + radius;
-        if (bottom_shared < tile_height)
-            sdata[bottom_shared * blockDim.x + tx] = (bottom_j < nrows)
-                ? imgin[bottom_j * ncols + i]
-                : 0.0f;
+    // Global position accounting for radius offset
+    int col = blockIdx.x * (blockDim.x - 2 * radius) + tx - radius;
+    int row = blockIdx.y * (blockDim.y - 2 * radius) + ty - radius;
+
+    // Load tile into shared memory
+    if (row >= 0 && row < nrows && col >= 0 && col < ncols) {
+        sdata[ty * blockDim.x + tx] = imgin[row * ncols + col];
+    }
+    else {
+        sdata[ty * blockDim.x + tx] = 0.0f;
     }
 
     __syncthreads();
 
-    // 4️⃣ Handle image borders
-    if (j < radius || j >= nrows - radius) {
-        if (i < ncols)
-            imgout[global_idx] = 0.0f;
-        return;
-    }
+    // Tile coordinates
+    int tileCol = tx - radius;
+    int tileRow = ty - radius;
 
-    // 5️⃣ Convolve vertically using shared memory
-    float sum = 0.0f;
-    for (int k = 0; k < kernel_width; k++) {
-        int s_row = shared_idx - radius + k;
-        sum += sdata[s_row * blockDim.x + tx] * kernel_data[k];
-    }
+    // Compute output for valid threads
+    if (tileCol >= 0 && tileCol < blockDim.x - 2 * radius &&
+        tileRow >= 0 && tileRow < blockDim.y - 2 * radius) {
 
-    imgout[global_idx] = sum;
+        if (col >= 0 && col < ncols && row >= 0 && row < nrows) {
+
+            // Zero out topmost and bottommost rows
+            if (row < radius || row >= nrows - radius) {
+                imgout[row * ncols + col] = 0.0f;
+                return;
+            }
+
+            // Optimized convolution
+            float sum = 0.0f;
+#pragma unroll 8
+            for (int k = 0; k < kernel_width; k++) {
+                int sharedRow = tileRow + k;
+                sum += sdata[sharedRow * blockDim.x + tx] * skernel[kernel_width - 1 - k];
+            }
+
+            imgout[row * ncols + col] = sum;
+        }
+    }
 }
-
-//cuda kernel without SM 
-// CUDA kernel for vertical convolution
-__global__ void convolveImageVertKernel(
-    const float* imgin,
-    const float* kernel_data,
-    int kernel_width,
-    int ncols,
-    int nrows,
-    float* imgout)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;  // column index
-    int j = blockIdx.y * blockDim.y + threadIdx.y;  // row index
-    
-    if (i >= ncols || j >= nrows)
-        return;
-    
-    int radius = kernel_width / 2;
-    int out_idx = j * ncols + i;
-    
-    // Zero topmost rows
-    if (j < radius) {
-        imgout[out_idx] = 0.0f;
-        return;
-    }
-    
-    // Zero bottommost rows
-    if (j >= nrows - radius) {
-        imgout[out_idx] = 0.0f;
-        return;
-    }
-    
-    // Convolve middle rows with kernel
-    float sum = 0.0f;
-    
-    for (int k = kernel_width - 1; k >= 0; k--) {
-        int ppp_idx = (j - radius + (kernel_width - 1 - k)) * ncols + i;
-        sum += imgin[ppp_idx] * kernel_data[k];
-    }
-    
-    imgout[out_idx] = sum;
-}
-
-// CUDA version of _convolveImageVert
-static void _convolveImageVert_cuda(
-    _KLT_FloatImage imgin,
-    ConvolutionKernel kernel,
-    _KLT_FloatImage imgout, 
-    cudaStream_t stream)
-{
-    int ncols = imgin->ncols;
-    int nrows = imgin->nrows;
-    size_t img_size = ncols * nrows * sizeof(float);
-    size_t kernel_size = kernel.width * sizeof(float);
-
-    // Allocate device memory
-    float* d_imgin, * d_imgout, * d_kernel;
-    cudaMalloc(&d_imgin, img_size);
-    cudaMalloc(&d_imgout, img_size);
-    cudaMalloc(&d_kernel, kernel_size);
-
-    // Copy data to device
-    cudaMemcpy(d_imgin, imgin->data, img_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kernel, kernel.data, kernel_size, cudaMemcpyHostToDevice);
-
-    // Configure and launch kernel
-    dim3 blockDim(16, 16);
-    dim3 gridDim((ncols + blockDim.x - 1) / blockDim.x,
-        (nrows + blockDim.y - 1) / blockDim.y);
-
-    convolveImageVertKernel_SM<< <gridDim, blockDim, 0, stream>> > (
-        d_imgin, d_kernel, kernel.width, ncols, nrows, d_imgout);
-
-    // Copy result back to host
-    cudaMemcpy(imgout->data, d_imgout, img_size, cudaMemcpyDeviceToHost);
-
-    // Free device memory
-    cudaFree(d_imgin);
-    cudaFree(d_imgout);
-    cudaFree(d_kernel);
-}
-
 
 /*********************************************************************
- * _convolveSeparate
+ * _convolveSeparate_cuda - OPTIMIZED with memory pool
  */
-
-static void _convolveSeparate(
-    _KLT_FloatImage imgin,
-    ConvolutionKernel horiz_kernel,
-    ConvolutionKernel vert_kernel,
-    _KLT_FloatImage imgout)
-{
-    /* Create temporary image */
-    _KLT_FloatImage tmpimg;
-    tmpimg = _KLTCreateFloatImage(imgin->ncols, imgin->nrows);
-    
-    /* Do convolution */
-    _convolveImageHoriz_cuda(imgin, horiz_kernel, tmpimg);
-    _convolveImageVert_cuda(tmpimg, vert_kernel, imgout);
-    
-    /* Free memory */
-    _KLTFreeFloatImage(tmpimg);
-}
-
-//use a stream 
 static void _convolveSeparate_cuda(
     _KLT_FloatImage imgin,
     ConvolutionKernel horiz_kernel,
@@ -583,94 +419,156 @@ static void _convolveSeparate_cuda(
     _KLT_FloatImage imgout,
     cudaStream_t stream)
 {
-    _KLT_FloatImage tmpimg = _KLTCreateFloatImage(imgin->ncols, imgin->nrows);
+    int ncols = imgin->ncols;
+    int nrows = imgin->nrows;
+    size_t img_size = ncols * nrows * sizeof(float);
 
-    _convolveImageHoriz_cuda(imgin, horiz_kernel, tmpimg, stream);
-    _convolveImageVert_cuda(tmpimg, vert_kernel, imgout, stream);
+    // Initialize or resize pool if needed
+    if (!g_conv_pool.initialized || g_conv_pool.img_capacity < img_size) {
+        if (g_conv_pool.initialized) {
+            cudaFree(g_conv_pool.d_imgin);
+            cudaFree(g_conv_pool.d_imgout);
+            cudaFree(g_conv_pool.d_tmpimg);
+            cudaFree(g_conv_pool.d_kernel);
+        }
+        cudaCheck(cudaMalloc(&g_conv_pool.d_imgin, img_size));
+        cudaCheck(cudaMalloc(&g_conv_pool.d_imgout, img_size));
+        cudaCheck(cudaMalloc(&g_conv_pool.d_tmpimg, img_size));
+        cudaCheck(cudaMalloc(&g_conv_pool.d_kernel, MAX_KERNEL_WIDTH * sizeof(float)));
+        g_conv_pool.img_capacity = img_size;
+        g_conv_pool.initialized = true;
+    }
 
-    _KLTFreeFloatImage(tmpimg);
+    // Initialize persistent kernel storage if needed
+    if (!kernels_on_device) {
+        cudaCheck(cudaMalloc(&d_gauss_kernel_data, MAX_KERNEL_WIDTH * sizeof(float)));
+        cudaCheck(cudaMalloc(&d_gaussderiv_kernel_data, MAX_KERNEL_WIDTH * sizeof(float)));
+        kernels_on_device = true;
+    }
+
+    // Use persistent buffers from pool
+    float* d_imgin = g_conv_pool.d_imgin;
+    float* d_tmpimg = g_conv_pool.d_tmpimg;
+    float* d_imgout = g_conv_pool.d_imgout;
+    float* d_kernel = g_conv_pool.d_kernel;
+
+    // Async copy input image
+    cudaCheck(cudaMemcpyAsync(d_imgin, imgin->data, img_size,
+        cudaMemcpyHostToDevice, stream));
+
+    // Configure kernel dimensions
+    int radius = horiz_kernel.width / 2;
+    dim3 blockDim(32, 32);
+    int out_tile_dim = blockDim.x - 2 * radius;
+    dim3 gridDim((ncols + out_tile_dim - 1) / out_tile_dim,
+        (nrows + out_tile_dim - 1) / out_tile_dim);
+
+    // OPTIMIZED: kernel data included in shared memory size
+    size_t shared_mem = blockDim.x * blockDim.y * sizeof(float) +
+        horiz_kernel.width * sizeof(float);
+
+    // === HORIZONTAL CONVOLUTION ===
+    cudaCheck(cudaMemcpyAsync(d_kernel, horiz_kernel.data,
+        horiz_kernel.width * sizeof(float),
+        cudaMemcpyHostToDevice, stream));
+
+    convolveImageHorizKernel_SM << <gridDim, blockDim, shared_mem, stream >> > (
+        d_imgin, d_kernel, horiz_kernel.width, ncols, nrows, d_tmpimg);
+    cudaCheck(cudaGetLastError());
+
+    // === VERTICAL CONVOLUTION ===
+    cudaCheck(cudaMemcpyAsync(d_kernel, vert_kernel.data,
+        vert_kernel.width * sizeof(float),
+        cudaMemcpyHostToDevice, stream));
+
+    convolveImageVertKernel_SM << <gridDim, blockDim, shared_mem, stream >> > (
+        d_tmpimg, d_kernel, vert_kernel.width, ncols, nrows, d_imgout);
+    cudaCheck(cudaGetLastError());
+
+    // === ASYNC COPY RESULT BACK ===
+    cudaCheck(cudaMemcpyAsync(imgout->data, d_imgout, img_size,
+        cudaMemcpyDeviceToHost, stream));
 }
 
-
-/*********************************************************************
- * _KLTComputeGradients
- */
-
-void _KLTComputeGradients(
-  _KLT_FloatImage img,
-  float sigma,
-  _KLT_FloatImage gradx,
-  _KLT_FloatImage grady)
+// Performance optimization: Batch process multiple convolutions
+void _convolveSeparate_batch(
+    _KLT_FloatImage* imgs_in,
+    ConvolutionKernel horiz_kernel,
+    ConvolutionKernel vert_kernel,
+    _KLT_FloatImage* imgs_out,
+    int batch_size)
 {
-				
-  /* Output images must be large enough to hold result */
-  assert(gradx->ncols >= img->ncols);
-  assert(gradx->nrows >= img->nrows);
-  assert(grady->ncols >= img->ncols);
-  assert(grady->nrows >= img->nrows);
+    if (batch_size == 0) return;
+    if (batch_size == 1) {
+        cudaStream_t stream = _getStream(0);
+        _convolveSeparate_cuda(imgs_in[0], horiz_kernel, vert_kernel, imgs_out[0], stream);
+        cudaStreamSynchronize(stream);
+        return;
+    }
 
-  /* Compute kernels, if necessary */
-  if (fabs(sigma - sigma_last) > 0.05)
-    _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
-	
-  _convolveSeparate(img, gaussderiv_kernel, gauss_kernel, gradx);
-  _convolveSeparate(img, gauss_kernel, gaussderiv_kernel, grady);
+    // For multiple images, use parallel streams
+    cudaStream_t* streams = (cudaStream_t*)malloc(batch_size * sizeof(cudaStream_t));
+    for (int i = 0; i < batch_size; i++) {
+        streams[i] = _getStream(i % 4);
+    }
 
+    // Launch all convolutions in parallel
+    for (int i = 0; i < batch_size; i++) {
+        _convolveSeparate_cuda(imgs_in[i], horiz_kernel, vert_kernel,
+            imgs_out[i], streams[i]);
+    }
+
+    // Synchronize all
+    for (int i = 0; i < batch_size; i++) {
+        cudaStreamSynchronize(streams[i]);
+    }
+
+    free(streams);
+}
+
+// Prefetch next image while processing current
+void _prefetchImage(float* d_buffer, float* h_data, size_t size, cudaStream_t stream) {
+    cudaMemcpyAsync(d_buffer, h_data, size, cudaMemcpyHostToDevice, stream);
 }
 	
-//use streaming 
 void _KLTComputeGradients(
-  _KLT_FloatImage img,
-  float sigma,
-  _KLT_FloatImage gradx,
-  _KLT_FloatImage grady)
+    _KLT_FloatImage img, float sigma,
+    _KLT_FloatImage gradx, _KLT_FloatImage grady)
 {
-  assert(gradx->ncols >= img->ncols);
-  assert(gradx->nrows >= img->nrows);
-  assert(grady->ncols >= img->ncols);
-  assert(grady->nrows >= img->nrows);
+    assert(gradx->ncols >= img->ncols);
+    assert(gradx->nrows >= img->nrows);
+    assert(grady->ncols >= img->ncols);
+    assert(grady->nrows >= img->nrows);
 
-  if (fabs(sigma - sigma_last) > 0.05)
-    _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
+    if (fabs(sigma - sigma_last) > 0.05)
+        _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
 
-  // Create two CUDA streams
-  cudaStream_t streamX, streamY;
-  cudaStreamCreate(&streamX);
-  cudaStreamCreate(&streamY);
+    // Use stream pool for parallel execution
+    cudaStream_t stream1 = _getStream(0);
+    cudaStream_t stream2 = _getStream(1);
 
-  // Launch both convolutions in parallel streams
-  _convolveSeparate_cuda(img, gaussderiv_kernel, gauss_kernel, gradx, streamX);
-  _convolveSeparate_cuda(img, gauss_kernel, gaussderiv_kernel, grady, streamY);
+    // Compute gradx and grady in parallel streams
+    _convolveSeparate_cuda(img, gaussderiv_kernel, gauss_kernel, gradx, stream1);
+    _convolveSeparate_cuda(img, gauss_kernel, gaussderiv_kernel, grady, stream2);
 
-  // Wait for both to finish
-  cudaStreamSynchronize(streamX);
-  cudaStreamSynchronize(streamY);
-
-  // Cleanup
-  cudaStreamDestroy(streamX);
-  cudaStreamDestroy(streamY);
+    // Synchronize both streams
+    cudaCheck(cudaStreamSynchronize(stream1));
+    cudaCheck(cudaStreamSynchronize(stream2));
 }
-
-
-
-/*********************************************************************
- * _KLTComputeSmoothedImage
- */
 
 void _KLTComputeSmoothedImage(
-  _KLT_FloatImage img,
-  float sigma,
-  _KLT_FloatImage smooth)
+    _KLT_FloatImage img, float sigma, _KLT_FloatImage smooth)
 {
-  /* Output image must be large enough to hold result */
-  assert(smooth->ncols >= img->ncols);
-  assert(smooth->nrows >= img->nrows);
+    assert(smooth->ncols >= img->ncols);
+    assert(smooth->nrows >= img->nrows);
 
-  /* Compute kernel, if necessary; gauss_deriv is not used */
-  if (fabs(sigma - sigma_last) > 0.05)
-    _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
+    if (fabs(sigma - sigma_last) > 0.05)
+        _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
 
-  _convolveSeparate(img, gauss_kernel, gauss_kernel, smooth);
+    // Use dedicated stream for smoothing
+    cudaStream_t stream = _getStream(2);
+    _convolveSeparate_cuda(img, gauss_kernel, gauss_kernel, smooth, stream);
+    cudaCheck(cudaStreamSynchronize(stream));
 }
 
 

@@ -16,6 +16,15 @@
 extern "C" {
 #endif
 
+void _KLTCleanupConvolveCUDA(void);
+
+void _KLTUploadImageToGPU(_KLT_FloatImage img, int slot);
+void _KLTUploadGradientsToGPU(_KLT_FloatImage gradx, _KLT_FloatImage grady, int slot);
+float* _KLTGetGPUImagePtr(int slot);
+float* _KLTGetGPUGradXPtr(int slot);
+float* _KLTGetGPUGradYPtr(int slot);
+void _KLTCleanupGPUImageStorage(void);
+
 void _KLTToFloatImage(
   KLT_PixelType *img,
   int ncols, int nrows,
@@ -40,5 +49,7 @@ void _KLTComputeSmoothedImage(
 #ifdef __cplusplus
 }
 #endif
+
+
 
 #endif

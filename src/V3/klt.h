@@ -33,6 +33,7 @@ typedef unsigned char KLT_PixelType;
 #define KLT_LARGE_RESIDUE    -5
 
 #include "klt_util.h" /* for affine mapping */
+#include <stdbool.h>
 
 /*******************
  * Structures
@@ -231,6 +232,13 @@ KLT_FeatureHistory KLTReadFeatureHistory(
 KLT_FeatureTable KLTReadFeatureTable(
   KLT_FeatureTable ft,
   char *filename);
+
+
+void _KLTCleanupAllCUDA();
+// Batch processing initialization
+void _KLTInitBatchConvolution(int max_batch_size);
+void _KLTCleanupBatchConvolution(void);
+
 #ifdef __cplusplus
 }
 #endif

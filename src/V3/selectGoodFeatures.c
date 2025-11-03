@@ -293,7 +293,196 @@ static float _minEigenvalue(float gxx, float gxy, float gyy)
 	
 
 /*********************************************************************/
+void _KLTSelectGoodFeatures_Optimized(
+  KLT_TrackingContext tc,
+  KLT_PixelType *img, 
+  int ncols, 
+  int nrows,
+  KLT_FeatureList featurelist,
+  selectionMode mode)
+{
+  _KLT_FloatImage floatimg, gradx, grady;
+  int window_hw, window_hh;
+  int *pointlist;
+  int npoints = 0;
+  KLT_BOOL overwriteAllFeatures = (mode == SELECTING_ALL) ?
+    TRUE : FALSE;
+  KLT_BOOL floatimages_created = FALSE;
 
+  /* Check window size (and correct if necessary) */
+  if (tc->window_width % 2 != 1) {
+    tc->window_width = tc->window_width+1;
+    KLTWarning("Tracking context's window width must be odd.  "
+               "Changing to %d.\n", tc->window_width);
+  }
+  if (tc->window_height % 2 != 1) {
+    tc->window_height = tc->window_height+1;
+    KLTWarning("Tracking context's window height must be odd.  "
+               "Changing to %d.\n", tc->window_height);
+  }
+  if (tc->window_width < 3) {
+    tc->window_width = 3;
+    KLTWarning("Tracking context's window width must be at least three.  \n"
+               "Changing to %d.\n", tc->window_width);
+  }
+  if (tc->window_height < 3) {
+    tc->window_height = 3;
+    KLTWarning("Tracking context's window height must be at least three.  \n"
+               "Changing to %d.\n", tc->window_height);
+  }
+  window_hw = tc->window_width/2; 
+  window_hh = tc->window_height/2;
+		
+  /* Create pointlist, which is a simplified version of a featurelist, */
+  /* for speed.  Contains only integer locations and values. */
+  pointlist = (int *) malloc(ncols * nrows * 3 * sizeof(int));
+
+  /* Create temporary images, etc. */
+  if (mode == REPLACING_SOME && 
+      tc->sequentialMode && tc->pyramid_last != NULL)  {
+    floatimg = ((_KLT_Pyramid) tc->pyramid_last)->img[0];
+    gradx = ((_KLT_Pyramid) tc->pyramid_last_gradx)->img[0];
+    grady = ((_KLT_Pyramid) tc->pyramid_last_grady)->img[0];
+    assert(gradx != NULL);
+    assert(grady != NULL);
+  } else  {
+    floatimages_created = TRUE;
+    floatimg = _KLTCreateFloatImage(ncols, nrows);
+    gradx    = _KLTCreateFloatImage(ncols, nrows);
+    grady    = _KLTCreateFloatImage(ncols, nrows);
+    if (tc->smoothBeforeSelecting)  {
+      _KLT_FloatImage tmpimg;
+      tmpimg = _KLTCreateFloatImage(ncols, nrows);
+      _KLTToFloatImage(img, ncols, nrows, tmpimg);
+      _KLTComputeSmoothedImage(tmpimg, _KLTComputeSmoothSigma(tc), floatimg);
+      _KLTFreeFloatImage(tmpimg);
+    } else _KLTToFloatImage(img, ncols, nrows, floatimg);
+ 
+    /* Compute gradient of image in x and y direction */
+    _KLTComputeGradients(floatimg, tc->grad_sigma, gradx, grady);
+  }
+	
+  /* Write internal images */
+  if (tc->writeInternalImages)  {
+    _KLTWriteFloatImageToPGM(floatimg, "kltimg_sgfrlf.pgm");
+    _KLTWriteFloatImageToPGM(gradx, "kltimg_sgfrlf_gx.pgm");
+    _KLTWriteFloatImageToPGM(grady, "kltimg_sgfrlf_gy.pgm");
+  }
+
+  /* =====================================================================
+   * PARALLELIZED EIGENVALUE COMPUTATION
+   * Compute trackability of each image pixel as the minimum
+   * of the two eigenvalues of the Z matrix
+   * ===================================================================== */
+  {
+    unsigned int limit = 1;
+    int borderx = tc->borderx;	/* Must not touch cols */
+    int bordery = tc->bordery;	/* lost by convolution */
+    int i;
+	
+    if (borderx < window_hw)  borderx = window_hw;
+    if (bordery < window_hh)  bordery = window_hh;
+
+    /* Find largest value of an int */
+    for (i = 0 ; i < sizeof(int) ; i++)  limit *= 256;
+    limit = limit/2 - 1;
+    
+    /* Calculate dimensions for parallel loop */
+    int skip = tc->nSkippedPixels + 1;
+    int y_count = (nrows - 2 * bordery + skip - 1) / skip;
+    int x_count = (ncols - 2 * borderx + skip - 1) / skip;
+    int total_candidates = y_count * x_count;
+    
+    /* Temporary storage for parallel computation */
+    int *temp_pointlist = (int *) malloc(total_candidates * 3 * sizeof(int));
+    
+    /* PARALLEL LOOP: Compute eigenvalues for all candidate pixels */
+    //#pragma omp parallel for collapse(2) schedule(dynamic, 64)
+    for (int y_idx = 0; y_idx < y_count; y_idx++) {
+      for (int x_idx = 0; x_idx < x_count; x_idx++) {
+        
+        int y = bordery + y_idx * skip;
+        int x = borderx + x_idx * skip;
+        
+        /* Bounds check */
+        if (y >= nrows - bordery || x >= ncols - borderx) continue;
+        
+        /* Sum the gradients in the surrounding window */
+        float gxx = 0.0f, gxy = 0.0f, gyy = 0.0f;
+        
+        for (int yy = y - window_hh; yy <= y + window_hh; yy++) {
+          for (int xx = x - window_hw; xx <= x + window_hw; xx++) {
+            float gx = gradx->data[ncols * yy + xx];
+            float gy = grady->data[ncols * yy + xx];
+            gxx += gx * gx;
+            gxy += gx * gy;
+            gyy += gy * gy;
+          }
+        }
+        
+        /* Compute minimum eigenvalue */
+        float val = _minEigenvalue(gxx, gxy, gyy);
+        
+        if (val > limit) {
+          val = (float) limit;
+        }
+        
+        /* Store in temporary array (thread-safe indexing) */
+        int idx = y_idx * x_count + x_idx;
+        temp_pointlist[idx * 3 + 0] = x;
+        temp_pointlist[idx * 3 + 1] = y;
+        temp_pointlist[idx * 3 + 2] = (int) val;
+      }
+    }
+    
+    /* Copy valid points to final pointlist (sequential, but fast) */
+    int *ptr = pointlist;
+    for (i = 0; i < total_candidates; i++) {
+      int x = temp_pointlist[i * 3 + 0];
+      int y = temp_pointlist[i * 3 + 1];
+      int val = temp_pointlist[i * 3 + 2];
+      
+      /* Only include points within valid range */
+      if (x >= borderx && x < ncols - borderx &&
+          y >= bordery && y < nrows - bordery) {
+        *ptr++ = x;
+        *ptr++ = y;
+        *ptr++ = val;
+        npoints++;
+      }
+    }
+    
+    free(temp_pointlist);
+  }
+			
+  /* Sort the features  */
+  _sortPointList(pointlist, npoints);
+
+  /* Check tc->mindist */
+  if (tc->mindist < 0)  {
+    KLTWarning("(_KLTSelectGoodFeatures) Tracking context field tc->mindist "
+               "is negative (%d); setting to zero", tc->mindist);
+    tc->mindist = 0;
+  }
+
+  /* Enforce minimum distance between features */
+  _enforceMinimumDistance(
+    pointlist,
+    npoints,
+    featurelist,
+    ncols, nrows,
+    tc->mindist,
+    tc->min_eigenvalue,
+    overwriteAllFeatures);
+
+  /* Free memory */
+  free(pointlist);
+  if (floatimages_created)  {
+    _KLTFreeFloatImage(floatimg);
+    _KLTFreeFloatImage(gradx);
+    _KLTFreeFloatImage(grady);
+  }
+}
 void _KLTSelectGoodFeatures(
   KLT_TrackingContext tc,
   KLT_PixelType *img, 

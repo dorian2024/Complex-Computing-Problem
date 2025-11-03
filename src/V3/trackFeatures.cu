@@ -8,7 +8,6 @@
 #include <math.h>		/* fabs() */
 #include <stdlib.h>		/* malloc() */
 #include <stdio.h>		/* fflush() */
-#include <omp.h>
 /* Our includes */
 #include "base.h"
 #include "error.h"
@@ -40,6 +39,198 @@ extern int KLT_verbose;
 #ifdef __cplusplus
 }
 #endif
+
+
+// Old cache cleanup - now redirects to new system
+void _KLTCleanupImageCache() {
+    // Kept for compatibility, but storage is now managed by _KLTCleanupGPUImageStorage
+}
+
+#define STREAM_POOL_SIZE 4
+
+typedef struct {
+    cudaStream_t streams[STREAM_POOL_SIZE];
+    bool initialized;
+} StreamPool;
+
+static StreamPool g_stream_pool = { {0}, false };
+
+static void _initStreamPool() {
+    if (!g_stream_pool.initialized) {
+        for (int i = 0; i < STREAM_POOL_SIZE; i++) {
+            cudaCheck(cudaStreamCreateWithFlags(&g_stream_pool.streams[i],
+                cudaStreamNonBlocking));
+        }
+        g_stream_pool.initialized = true;
+    }
+}
+
+static cudaStream_t _getStream(int index) {
+    _initStreamPool();
+    return g_stream_pool.streams[index % STREAM_POOL_SIZE];
+}
+
+
+void _KLTCleanupStreamPool() {
+    if (g_stream_pool.initialized) {
+        for (int i = 0; i < STREAM_POOL_SIZE; i++) {
+            cudaStreamDestroy(g_stream_pool.streams[i]);
+        }
+        g_stream_pool.initialized = false;
+    }
+}
+
+typedef struct {
+    float* d_img1;
+    float* d_img2;
+    float* d_diff;
+    size_t img_capacity;
+    size_t diff_capacity;
+    bool initialized;
+} IntensityDiffPool;
+
+static IntensityDiffPool g_diff_pool = { NULL, NULL, NULL, 0, 0, false };
+
+typedef struct {
+    float* d_gradx1;
+    float* d_grady1;
+    float* d_gradx2;
+    float* d_grady2;
+    float* d_gradx_out;
+    float* d_grady_out;
+    size_t grad_capacity;
+    size_t win_capacity;
+    bool initialized;
+} GradientSumPool;
+
+static GradientSumPool g_grad_pool = { NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, false };
+
+static float* h_pinned_buffer = NULL;
+static size_t h_pinned_capacity = 0;
+
+static void _ensurePinnedBuffer(size_t required_bytes) {
+    if (h_pinned_capacity < required_bytes) {
+        if (h_pinned_buffer) cudaFreeHost(h_pinned_buffer);
+        cudaCheck(cudaMallocHost(&h_pinned_buffer, required_bytes));
+        h_pinned_capacity = required_bytes;
+    }
+}
+
+void _KLTCleanupPinnedMemory() {
+    if (h_pinned_buffer) {
+        cudaFreeHost(h_pinned_buffer);
+        h_pinned_buffer = NULL;
+        h_pinned_capacity = 0;
+    }
+}
+
+#define MAX_GPU_IMAGES 8  // Store multiple pyramid levels
+
+typedef struct {
+    float* d_images[MAX_GPU_IMAGES];
+    float* d_gradx[MAX_GPU_IMAGES];
+    float* d_grady[MAX_GPU_IMAGES];
+    size_t img_sizes[MAX_GPU_IMAGES];
+    size_t grad_sizes[MAX_GPU_IMAGES];  // Separate size tracking for gradients
+    bool img_valid[MAX_GPU_IMAGES];
+    bool grad_valid[MAX_GPU_IMAGES];
+    bool initialized;
+} PersistentGPUStorage;
+
+static PersistentGPUStorage g_gpu_storage = {
+    {NULL}, {NULL}, {NULL}, {0}, {0}, {false}, {false}, false
+};
+
+// Simple global slot tracking (no threading needed since CUDA calls are serialized)
+static int g_current_img1_slot = -1;
+static int g_current_img2_slot = -1;
+
+static void _setCurrentGPUSlots(int slot1, int slot2) {
+    g_current_img1_slot = slot1;
+    g_current_img2_slot = slot2;
+}
+
+// Upload image to GPU and keep it there
+void _KLTUploadImageToGPU(_KLT_FloatImage img, int slot) {
+    if (slot < 0 || slot >= MAX_GPU_IMAGES) return;
+
+    size_t size = img->ncols * img->nrows * sizeof(float);
+
+    if (!g_gpu_storage.img_valid[slot] || g_gpu_storage.img_sizes[slot] < size) {
+        if (g_gpu_storage.img_valid[slot]) {
+            cudaFree(g_gpu_storage.d_images[slot]);
+        }
+        cudaCheck(cudaMalloc(&g_gpu_storage.d_images[slot], size));
+        g_gpu_storage.img_sizes[slot] = size;
+    }
+
+    cudaCheck(cudaMemcpy(g_gpu_storage.d_images[slot], img->data, size, cudaMemcpyHostToDevice));
+    g_gpu_storage.img_valid[slot] = true;
+    g_gpu_storage.initialized = true;
+}
+
+// Upload gradients to GPU and keep them there
+void _KLTUploadGradientsToGPU(_KLT_FloatImage gradx, _KLT_FloatImage grady, int slot) {
+    if (slot < 0 || slot >= MAX_GPU_IMAGES) return;
+
+    size_t size = gradx->ncols * gradx->nrows * sizeof(float);
+
+    if (!g_gpu_storage.grad_valid[slot] || g_gpu_storage.grad_sizes[slot] < size) {
+        if (g_gpu_storage.grad_valid[slot]) {
+            cudaFree(g_gpu_storage.d_gradx[slot]);
+            cudaFree(g_gpu_storage.d_grady[slot]);
+        }
+        cudaCheck(cudaMalloc(&g_gpu_storage.d_gradx[slot], size));
+        cudaCheck(cudaMalloc(&g_gpu_storage.d_grady[slot], size));
+        g_gpu_storage.grad_sizes[slot] = size;
+    }
+
+    cudaStream_t stream1 = _getStream(0);
+    cudaStream_t stream2 = _getStream(1);
+
+    cudaCheck(cudaMemcpyAsync(g_gpu_storage.d_gradx[slot], gradx->data, size,
+        cudaMemcpyHostToDevice, stream1));
+    cudaCheck(cudaMemcpyAsync(g_gpu_storage.d_grady[slot], grady->data, size,
+        cudaMemcpyHostToDevice, stream2));
+
+    cudaStreamSynchronize(stream1);
+    cudaStreamSynchronize(stream2);
+
+    g_gpu_storage.grad_valid[slot] = true;
+    g_gpu_storage.initialized = true;
+}
+
+float* _KLTGetGPUImagePtr(int slot) {
+    return (slot >= 0 && slot < MAX_GPU_IMAGES && g_gpu_storage.img_valid[slot])
+        ? g_gpu_storage.d_images[slot] : NULL;
+}
+
+float* _KLTGetGPUGradXPtr(int slot) {
+    return (slot >= 0 && slot < MAX_GPU_IMAGES && g_gpu_storage.grad_valid[slot])
+        ? g_gpu_storage.d_gradx[slot] : NULL;
+}
+
+float* _KLTGetGPUGradYPtr(int slot) {
+    return (slot >= 0 && slot < MAX_GPU_IMAGES && g_gpu_storage.grad_valid[slot])
+        ? g_gpu_storage.d_grady[slot] : NULL;
+}
+
+void _KLTCleanupGPUImageStorage(void) {
+    if (g_gpu_storage.initialized) {
+        for (int i = 0; i < MAX_GPU_IMAGES; i++) {
+            if (g_gpu_storage.img_valid[i]) {
+                cudaFree(g_gpu_storage.d_images[i]);
+                g_gpu_storage.img_valid[i] = false;
+            }
+            if (g_gpu_storage.grad_valid[i]) {
+                cudaFree(g_gpu_storage.d_gradx[i]);
+                cudaFree(g_gpu_storage.d_grady[i]);
+                g_gpu_storage.grad_valid[i] = false;
+            }
+        }
+        g_gpu_storage.initialized = false;
+    }
+}
 
 
 typedef float *_FloatWindow;
@@ -136,72 +327,88 @@ static void _computeIntensityDifference(
 
 //kernel function
 __global__ void computeIntensityDifferenceKernel(
-	const float* img1,
-	const float* img2,
-	int ncols, int nrows,
-	float x1, float y1,
-	float x2, float y2,
-	int width,
-	int height,
-	float* imgdiff)   // flat array of size width*height
+    const float* img1,
+    const float* img2,
+    int ncols, int nrows,
+    float x1, float y1,
+    float x2, float y2,
+    int width,
+    int height,
+    float* imgdiff)
 {
-	int i_idx = threadIdx.x + blockIdx.x * blockDim.x;
-	int j_idx = threadIdx.y + blockIdx.y * blockDim.y;
+    int i_idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int j_idx = threadIdx.y + blockIdx.y * blockDim.y;
 
-	int hw = width / 2;
-	int hh = height / 2;
+    int hw = width / 2;
+    int hh = height / 2;
 
-	if (i_idx > width - 1 || j_idx > height - 1) return;
+    if (i_idx >= width || j_idx >= height) return;
 
-	int i = i_idx - hw;
-	int j = j_idx - hh;
+    int i = i_idx - hw;
+    int j = j_idx - hh;
 
-	float g1 = interpolate_cuda(x1 + i, y1 + j, img1, ncols, nrows);
-	float g2 = interpolate_cuda(x2 + i, y2 + j, img2, ncols, nrows);
+    float g1 = interpolate_cuda(x1 + i, y1 + j, img1, ncols, nrows);
+    float g2 = interpolate_cuda(x2 + i, y2 + j, img2, ncols, nrows);
 
-	imgdiff[j_idx * width + i_idx] = g1 - g2;
+    imgdiff[j_idx * width + i_idx] = g1 - g2;
 }
 
-//wrapper
 void _computeIntensityDifference_cuda(
-	_KLT_FloatImage img1,
-	_KLT_FloatImage img2,
-	float x1, float y1,
-	float x2, float y2,
-	int width,
-	int height,
-	_FloatWindow imgdiff)  // float* of size width*height
+    _KLT_FloatImage img1, _KLT_FloatImage img2,
+    float x1, float y1, float x2, float y2,
+    int width, int height, _FloatWindow imgdiff)
 {
-	const size_t img_bytes = img1->ncols * img1->nrows * sizeof(float);
-	const size_t diff_bytes = width * height * sizeof(float);
+    const size_t diff_bytes = width * height * sizeof(float);
 
-	float* d_img1, *d_img2, *d_diff;
-	d_img1 = nullptr;
-	d_img2 = nullptr;
-	d_diff = nullptr;
-	cudaCheck(cudaMalloc(&d_img1, img_bytes));
-	cudaCheck(cudaMalloc(&d_img2, img_bytes));
-	cudaCheck(cudaMalloc(&d_diff, diff_bytes));
+    // Pool initialization
+    if (!g_diff_pool.initialized || g_diff_pool.diff_capacity < diff_bytes) {
+        if (g_diff_pool.initialized) {
+            cudaFree(g_diff_pool.d_diff);
+        }
+        cudaCheck(cudaMalloc(&g_diff_pool.d_diff, diff_bytes * 4));
+        g_diff_pool.diff_capacity = diff_bytes * 4;
+        g_diff_pool.initialized = true;
+    }
 
-	cudaCheck(cudaMemcpy(d_img1, img1->data, img_bytes, cudaMemcpyHostToDevice));
-	cudaCheck(cudaMemcpy(d_img2, img2->data, img_bytes, cudaMemcpyHostToDevice));
+    // Try to use GPU-resident data
+    float* d_img1 = _KLTGetGPUImagePtr(g_current_img1_slot);
+    float* d_img2 = _KLTGetGPUImagePtr(g_current_img2_slot);
 
-	dim3 blockDim(32,32);
-	dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
-		(height + blockDim.y - 1) / blockDim.y);
+    if (!d_img1 || !d_img2 || g_current_img1_slot < 0 || g_current_img2_slot < 0) {
+        // Fallback: use CPU version
+        _computeIntensityDifference(img1, img2, x1, y1, x2, y2, width, height, imgdiff);
+        return;
+    }
 
-	computeIntensityDifferenceKernel<<<gridDim, blockDim >> > (
-		d_img1, d_img2, img1->ncols, img1->nrows,
-		x1, y1, x2, y2, width, height, d_diff
-		);
-	cudaCheck(cudaGetLastError());
-	cudaCheck(cudaDeviceSynchronize());
+    cudaStream_t stream = _getStream(0);
 
-	cudaCheck(cudaMemcpy(imgdiff, d_diff, diff_bytes, cudaMemcpyDeviceToHost));
+    dim3 blockDim(32, 32);
+    dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
+        (height + blockDim.y - 1) / blockDim.y);
 
-	cudaCheck(cudaFree(d_img1));
-	cudaCheck(cudaFree(d_img2));
-	cudaCheck(cudaFree(d_diff));
+    computeIntensityDifferenceKernel << <gridDim, blockDim, 0, stream >> > (
+        d_img1, d_img2, img1->ncols, img1->nrows,
+        x1, y1, x2, y2, width, height, g_diff_pool.d_diff);
+
+    cudaCheck(cudaGetLastError());
+
+    // Use pinned memory for faster transfer
+    _ensurePinnedBuffer(diff_bytes);
+    cudaCheck(cudaMemcpyAsync(h_pinned_buffer, g_diff_pool.d_diff, diff_bytes,
+        cudaMemcpyDeviceToHost, stream));
+    cudaCheck(cudaStreamSynchronize(stream));
+
+    memcpy(imgdiff, h_pinned_buffer, diff_bytes);
+}
+
+// Add cleanup function
+void _KLTCleanupIntensityDiffCUDA() {
+    if (g_diff_pool.initialized) {
+        cudaFree(g_diff_pool.d_img1);
+        cudaFree(g_diff_pool.d_img2);
+        cudaFree(g_diff_pool.d_diff);
+        g_diff_pool.initialized = false;
+    }
 }
 
 
@@ -239,34 +446,6 @@ static void _computeGradientSum(
       g2 = interpolate_cuda(x2+i, y2+j, grady2);
       *grady++ = g1 + g2;
     }
-}
-
-__global__ void computeGradientSumKernel(
-	const float* gradx1, const float* grady1,
-	const float* gradx2, const float* grady2,
-	float* gradx_out, float* grady_out,
-	float x1, float y1, float x2, float y2,
-	int width, int height,
-	int imgWidth, int imgHeight)
-{
-	int tx = blockIdx.x * blockDim.x + threadIdx.x;
-	int ty = blockIdx.y * blockDim.y + threadIdx.y;
-
-	if (tx >= width || ty >= height) return;
-
-	int hw = width / 2;
-	int hh = height / 2;
-
-	int i = tx - hw;
-	int j = ty - hh;
-
-	float g1x = interpolate_cuda(x1 + i, y1 + j, gradx1, imgWidth, imgHeight);
-	float g2x = interpolate_cuda(x2 + i, y2 + j, gradx2, imgWidth, imgHeight);
-	gradx_out[ty * width + tx] = g1x + g2x;
-
-	float g1y = interpolate_cuda(x1 + i, y1 + j, grady1, imgWidth, imgHeight);
-	float g2y = interpolate_cuda(x2 + i, y2 + j, grady2, imgWidth, imgHeight);
-	grady_out[ty * width + tx] = g1y + g2y;
 }
 
 // Device function for interpolation (replaces lambda which causes issues)
@@ -323,54 +502,51 @@ __global__ void computeGradientSumKernel_SM(
     int imgWidth, int imgHeight)
 {
     extern __shared__ float sharedMem[];
-    
+
     // Divide shared memory into 4 tiles
     int tileW = blockDim.x + 1;
     int tileH = blockDim.y + 1;
     int tileSize = tileW * tileH;
-    
+
     float* tile_gradx1 = sharedMem;
     float* tile_grady1 = sharedMem + tileSize;
     float* tile_gradx2 = sharedMem + 2 * tileSize;
     float* tile_grady2 = sharedMem + 3 * tileSize;
-    
+
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int bx = blockIdx.x * blockDim.x;
     int by = blockIdx.y * blockDim.y;
-    
+
     int tx_global = bx + tx;
     int ty_global = by + ty;
-    
-    // Early exit for out-of-bounds threads
+
     if (tx_global >= width || ty_global >= height)
         return;
-    
+
     int hw = width / 2;
     int hh = height / 2;
     int i = tx_global - hw;
     int j = ty_global - hh;
-    
-    // --- Load gradient data into shared memory ---
-    // Fixed: Use local thread indices for shared memory indexing
+
+    // Load gradient data with coalescing
     int tile_idx = ty * tileW + tx;
-    
-    // Load from global memory if within bounds
+
     if (tx_global < imgWidth && ty_global < imgHeight) {
         int img_idx = ty_global * imgWidth + tx_global;
         tile_gradx1[tile_idx] = gradx1[img_idx];
         tile_grady1[tile_idx] = grady1[img_idx];
         tile_gradx2[tile_idx] = gradx2[img_idx];
         tile_grady2[tile_idx] = grady2[img_idx];
-    } else {
-        // Initialize to 0 if out of bounds
+    }
+    else {
         tile_gradx1[tile_idx] = 0.0f;
         tile_grady1[tile_idx] = 0.0f;
         tile_gradx2[tile_idx] = 0.0f;
         tile_grady2[tile_idx] = 0.0f;
     }
-    
-    // Load halo elements (boundary pixels for interpolation)
+
+    // Load halo elements for interpolation
     if (tx == blockDim.x - 1 && tx_global + 1 < imgWidth && ty_global < imgHeight) {
         int halo_idx = ty * tileW + (tx + 1);
         int img_idx = ty_global * imgWidth + (tx_global + 1);
@@ -379,7 +555,7 @@ __global__ void computeGradientSumKernel_SM(
         tile_gradx2[halo_idx] = gradx2[img_idx];
         tile_grady2[halo_idx] = grady2[img_idx];
     }
-    
+
     if (ty == blockDim.y - 1 && ty_global + 1 < imgHeight && tx_global < imgWidth) {
         int halo_idx = (ty + 1) * tileW + tx;
         int img_idx = (ty_global + 1) * imgWidth + tx_global;
@@ -388,9 +564,8 @@ __global__ void computeGradientSumKernel_SM(
         tile_gradx2[halo_idx] = gradx2[img_idx];
         tile_grady2[halo_idx] = grady2[img_idx];
     }
-    
-    // Corner halo element
-    if (tx == blockDim.x - 1 && ty == blockDim.y - 1 && 
+
+    if (tx == blockDim.x - 1 && ty == blockDim.y - 1 &&
         tx_global + 1 < imgWidth && ty_global + 1 < imgHeight) {
         int halo_idx = (ty + 1) * tileW + (tx + 1);
         int img_idx = (ty_global + 1) * imgWidth + (tx_global + 1);
@@ -399,104 +574,109 @@ __global__ void computeGradientSumKernel_SM(
         tile_gradx2[halo_idx] = gradx2[img_idx];
         tile_grady2[halo_idx] = grady2[img_idx];
     }
-    
+
     __syncthreads();
-    
-    // --- Compute interpolations ---
+
+    // Compute interpolations
     float px1 = x1 + i;
     float py1 = y1 + j;
     float px2 = x2 + i;
     float py2 = y2 + j;
-    
-    float g1x = interpolate_SM(px1, py1, gradx1, tile_gradx1, 
-                               bx, by, tileW, tileH, imgWidth, imgHeight);
-    float g2x = interpolate_SM(px2, py2, gradx2, tile_gradx2, 
-                               bx, by, tileW, tileH, imgWidth, imgHeight);
-    
-    float g1y = interpolate_SM(px1, py1, grady1, tile_grady1, 
-                               bx, by, tileW, tileH, imgWidth, imgHeight);
-    float g2y = interpolate_SM(px2, py2, grady2, tile_grady2, 
-                               bx, by, tileW, tileH, imgWidth, imgHeight);
-    
-    // Write output
+
+    float g1x = interpolate_SM(px1, py1, gradx1, tile_gradx1,
+        bx, by, tileW, tileH, imgWidth, imgHeight);
+    float g2x = interpolate_SM(px2, py2, gradx2, tile_gradx2,
+        bx, by, tileW, tileH, imgWidth, imgHeight);
+
+    float g1y = interpolate_SM(px1, py1, grady1, tile_grady1,
+        bx, by, tileW, tileH, imgWidth, imgHeight);
+    float g2y = interpolate_SM(px2, py2, grady2, tile_grady2,
+        bx, by, tileW, tileH, imgWidth, imgHeight);
+
+    // Write output with coalescing
     int out_idx = ty_global * width + tx_global;
     gradx_out[out_idx] = g1x + g2x;
     grady_out[out_idx] = g1y + g2y;
 }
 
+
 static void _computeGradientSum_cuda(
-	_KLT_FloatImage gradx1, _KLT_FloatImage grady1,
-	_KLT_FloatImage gradx2, _KLT_FloatImage grady2,
-	float x1, float y1,
-	float x2, float y2,
-	int width, int height,
-	_FloatWindow gradx, _FloatWindow grady)
+    _KLT_FloatImage gradx1, _KLT_FloatImage grady1,
+    _KLT_FloatImage gradx2, _KLT_FloatImage grady2,
+    float x1, float y1, float x2, float y2,
+    int width, int height, _FloatWindow gradx, _FloatWindow grady)
 {
-	int imgWidth = gradx1->ncols;
-	int imgHeight = gradx1->nrows;
+    int imgWidth = gradx1->ncols;
+    int imgHeight = gradx1->nrows;
+    size_t winBytes = width * height * sizeof(float);
 
-	size_t imgBytes = imgWidth * imgHeight * sizeof(float);
-	size_t winBytes = width * height * sizeof(float);
+    // Pool initialization
+    if (!g_grad_pool.initialized || g_grad_pool.win_capacity < winBytes * 2) {
+        if (g_grad_pool.initialized) {
+            cudaFree(g_grad_pool.d_gradx_out);
+            cudaFree(g_grad_pool.d_grady_out);
+        }
+        cudaCheck(cudaMalloc(&g_grad_pool.d_gradx_out, winBytes * 8));
+        cudaCheck(cudaMalloc(&g_grad_pool.d_grady_out, winBytes * 8));
+        g_grad_pool.win_capacity = winBytes * 8;
+        g_grad_pool.initialized = true;
+    }
 
-	float* d_gradx1, * d_grady1, * d_gradx2, * d_grady2;
-	float* d_gradx_out, * d_grady_out;
+    // Try to use GPU-resident data
+    float* d_gradx1 = _KLTGetGPUGradXPtr(g_current_img1_slot);
+    float* d_grady1 = _KLTGetGPUGradYPtr(g_current_img1_slot);
+    float* d_gradx2 = _KLTGetGPUGradXPtr(g_current_img2_slot);
+    float* d_grady2 = _KLTGetGPUGradYPtr(g_current_img2_slot);
 
-	cudaMalloc(&d_gradx1, imgBytes);
-	cudaMalloc(&d_grady1, imgBytes);
-	cudaMalloc(&d_gradx2, imgBytes);
-	cudaMalloc(&d_grady2, imgBytes);
-	cudaMalloc(&d_gradx_out, winBytes);
-	cudaMalloc(&d_grady_out, winBytes);
+    if (!d_gradx1 || !d_grady1 || !d_gradx2 || !d_grady2 ||
+        g_current_img1_slot < 0 || g_current_img2_slot < 0) {
+        // Fallback
+        _computeGradientSum(gradx1, grady1, gradx2, grady2, x1, y1, x2, y2,
+            width, height, gradx, grady);
+        return;
+    }
 
-	cudaMemcpy(d_gradx1, gradx1->data, imgBytes, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_grady1, grady1->data, imgBytes, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_gradx2, gradx2->data, imgBytes, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_grady2, grady2->data, imgBytes, cudaMemcpyHostToDevice);
+    cudaStream_t stream = _getStream(0);
 
+    int blockSize = 16;
+    dim3 block(blockSize, blockSize);
+    dim3 grid((width + blockSize - 1) / blockSize,
+        (height + blockSize - 1) / blockSize);
+    int sharedMemSize = 4 * (blockSize + 1) * (blockSize + 1) * sizeof(float);
 
+    computeGradientSumKernel_SM << <grid, block, sharedMemSize, stream >> > (
+        d_gradx1, d_grady1, d_gradx2, d_grady2,
+        g_grad_pool.d_gradx_out, g_grad_pool.d_grady_out,
+        x1, y1, x2, y2, width, height, imgWidth, imgHeight);
 
-//umaima changed things here
- 
-int blockSize = 16; // or whatever you're using
-dim3 block(blockSize, blockSize);
-dim3 grid((width + blockSize - 1) / blockSize, 
-          (height + blockSize - 1) / blockSize);
+    cudaCheck(cudaGetLastError());
 
-// Shared memory size: 4 tiles * (blockSize+1)^2 floats
+    // Use pinned memory
+    _ensurePinnedBuffer(winBytes * 2);
 
-int sharedMemSize = 4 * (blockSize + 1) * (blockSize + 1) * sizeof(float);
+    cudaCheck(cudaMemcpyAsync(h_pinned_buffer, g_grad_pool.d_gradx_out, winBytes,
+        cudaMemcpyDeviceToHost, stream));
+    cudaCheck(cudaMemcpyAsync(h_pinned_buffer + width * height,
+        g_grad_pool.d_grady_out, winBytes,
+        cudaMemcpyDeviceToHost, stream));
 
-computeGradientSumKernel_SM<<<grid, block, sharedMemSize>>>(d_gradx1, d_grady1, d_gradx2, d_grady2,
-		d_gradx_out, d_grady_out,
-		x1, y1, x2, y2,
-		width, height,
-		imgWidth, imgHeight
-		);
+    cudaStreamSynchronize(stream);
 
+    memcpy(gradx, h_pinned_buffer, winBytes);
+    memcpy(grady, h_pinned_buffer + width * height, winBytes);
+}
 
-//umaima changed things here
-/*
-	// Full parallel launch over the window
-	dim3 block(32,32);
-	dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
-
-	computeGradientSumKernel<<<grid, block >> > (
-		d_gradx1, d_grady1, d_gradx2, d_grady2,
-		d_gradx_out, d_grady_out,
-		x1, y1, x2, y2,
-		width, height,
-		imgWidth, imgHeight
-		);
-	*/
-	
-	cudaDeviceSynchronize();
-
-	cudaMemcpy(gradx, d_gradx_out, winBytes, cudaMemcpyDeviceToHost);
-	cudaMemcpy(grady, d_grady_out, winBytes, cudaMemcpyDeviceToHost);
-
-	cudaFree(d_gradx1); cudaFree(d_grady1);
-	cudaFree(d_gradx2); cudaFree(d_grady2);
-	cudaFree(d_gradx_out); cudaFree(d_grady_out);
+// Add cleanup function
+void _KLTCleanupGradientSumCUDA() {
+    if (g_grad_pool.initialized) {
+        cudaFree(g_grad_pool.d_gradx1);
+        cudaFree(g_grad_pool.d_grady1);
+        cudaFree(g_grad_pool.d_gradx2);
+        cudaFree(g_grad_pool.d_grady2);
+        cudaFree(g_grad_pool.d_gradx_out);
+        cudaFree(g_grad_pool.d_grady_out);
+        g_grad_pool.initialized = false;
+    }
 }
 
 /*********************************************************************
@@ -1912,40 +2092,39 @@ extern "C" {
 
 void KLTTrackFeatures_Optimized(
     KLT_TrackingContext tc,
-    KLT_PixelType *img1,
-    KLT_PixelType *img2,
+    KLT_PixelType* img1,
+    KLT_PixelType* img2,
     int ncols,
     int nrows,
     KLT_FeatureList featurelist)
 {
     _KLT_FloatImage tmpimg, floatimg1, floatimg2;
     _KLT_Pyramid pyramid1, pyramid1_gradx, pyramid1_grady,
-                pyramid2, pyramid2_gradx, pyramid2_grady;
-    float subsampling = (float) tc->subsampling;
+        pyramid2, pyramid2_gradx, pyramid2_grady;
+    float subsampling = (float)tc->subsampling;
     int floatimg1_created = FALSE;
-    
-    // Input validation (same as original)
+
     if (KLT_verbose >= 1) {
         fprintf(stderr, "(KLT) Tracking %d features in a %d by %d image...  ",
-                KLTCountRemainingFeatures(featurelist), ncols, nrows);
+            KLTCountRemainingFeatures(featurelist), ncols, nrows);
         fflush(stderr);
     }
 
-    // Check window size (same as original)
+    // Check window size
     if (tc->window_width % 2 != 1) tc->window_width++;
     if (tc->window_height % 2 != 1) tc->window_height++;
     if (tc->window_width < 3) tc->window_width = 3;
     if (tc->window_height < 3) tc->window_height = 3;
 
-    // Create temporary image
     tmpimg = _KLTCreateFloatImage(ncols, nrows);
 
     // Process first image pyramid
     if (tc->sequentialMode && tc->pyramid_last != NULL) {
-        pyramid1 = (_KLT_Pyramid) tc->pyramid_last;
-        pyramid1_gradx = (_KLT_Pyramid) tc->pyramid_last_gradx;
-        pyramid1_grady = (_KLT_Pyramid) tc->pyramid_last_grady;
-    } else {
+        pyramid1 = (_KLT_Pyramid)tc->pyramid_last;
+        pyramid1_gradx = (_KLT_Pyramid)tc->pyramid_last_gradx;
+        pyramid1_grady = (_KLT_Pyramid)tc->pyramid_last_grady;
+    }
+    else {
         floatimg1_created = TRUE;
         floatimg1 = _KLTCreateFloatImage(ncols, nrows);
         _KLTToFloatImage(img1, ncols, nrows, tmpimg);
@@ -1954,6 +2133,11 @@ void KLTTrackFeatures_Optimized(
         _KLTComputePyramid(floatimg1, pyramid1, tc->pyramid_sigma_fact);
         pyramid1_gradx = _KLTCreatePyramid(ncols, nrows, (int)subsampling, tc->nPyramidLevels);
         pyramid1_grady = _KLTCreatePyramid(ncols, nrows, (int)subsampling, tc->nPyramidLevels);
+
+        for (int i = 0; i < tc->nPyramidLevels; i++) {
+            _KLTComputeGradients(pyramid1->img[i], tc->grad_sigma,
+                pyramid1_gradx->img[i], pyramid1_grady->img[i]);
+        }
     }
 
     // Process second image pyramid
@@ -1965,59 +2149,125 @@ void KLTTrackFeatures_Optimized(
     pyramid2_gradx = _KLTCreatePyramid(ncols, nrows, (int)subsampling, tc->nPyramidLevels);
     pyramid2_grady = _KLTCreatePyramid(ncols, nrows, (int)subsampling, tc->nPyramidLevels);
 
-    // Compute gradients for all pyramid levels in sequence
     for (int i = 0; i < tc->nPyramidLevels; i++) {
-        if (floatimg1_created) { // Only compute if we created pyramid1
-            _KLTComputeGradients(pyramid1->img[i], tc->grad_sigma, 
-                               pyramid1_gradx->img[i], pyramid1_grady->img[i]);
-        }
-        _KLTComputeGradients(pyramid2->img[i], tc->grad_sigma, 
-                           pyramid2_gradx->img[i], pyramid2_grady->img[i]);
+        _KLTComputeGradients(pyramid2->img[i], tc->grad_sigma,
+            pyramid2_gradx->img[i], pyramid2_grady->img[i]);
     }
 
-    // PARALLEL FEATURE TRACKING - MAIN OPTIMIZATION
-    #pragma omp parallel for schedule(dynamic)
+    // **KEY OPTIMIZATION**: Upload ALL pyramid levels to GPU ONCE
+    // Use slots 0-3 for pyramid1 (levels 0-3), slots 4-7 for pyramid2 (levels 0-3)
+    for (int r = 0; r < tc->nPyramidLevels && r < 4; r++) {
+        _KLTUploadImageToGPU(pyramid1->img[r], r);
+        _KLTUploadGradientsToGPU(pyramid1_gradx->img[r], pyramid1_grady->img[r], r);
+
+        _KLTUploadImageToGPU(pyramid2->img[r], r + 4);
+        _KLTUploadGradientsToGPU(pyramid2_gradx->img[r], pyramid2_grady->img[r], r + 4);
+    }
+
+    // Track all features (sequentially to avoid slot conflicts)
     for (int indx = 0; indx < featurelist->nFeatures; indx++) {
         if (featurelist->feature[indx]->val >= 0) {
             float xloc = featurelist->feature[indx]->x;
             float yloc = featurelist->feature[indx]->y;
             float xlocout = xloc, ylocout = yloc;
-            
+
             // Transform to coarsest resolution
             for (int r = tc->nPyramidLevels - 1; r >= 0; r--) {
-                xloc /= subsampling;  
+                xloc /= subsampling;
                 yloc /= subsampling;
             }
-            
+            xlocout = xloc;
+            ylocout = yloc;
+
             // Track through pyramid levels
             int val = KLT_TRACKED;
             for (int r = tc->nPyramidLevels - 1; r >= 0; r--) {
-                xloc *= subsampling;  
+                xloc *= subsampling;
                 yloc *= subsampling;
-                xlocout *= subsampling;  
+                xlocout *= subsampling;
                 ylocout *= subsampling;
 
+                // Set which GPU slots to use for this level
+                if (r < 4) {
+                    _setCurrentGPUSlots(r, r + 4);
+                }
+                else {
+                    _setCurrentGPUSlots(-1, -1);  // Use CPU fallback for higher levels
+                }
+
                 val = _trackFeature(xloc, yloc, &xlocout, &ylocout,
-                                  pyramid1->img[r], pyramid1_gradx->img[r], pyramid1_grady->img[r],
-                                  pyramid2->img[r], pyramid2_gradx->img[r], pyramid2_grady->img[r],
-                                  tc->window_width, tc->window_height, tc->step_factor,
-                                  tc->max_iterations, tc->min_determinant, tc->min_displacement,
-                                  tc->max_residue, tc->lighting_insensitive);
+                    pyramid1->img[r], pyramid1_gradx->img[r], pyramid1_grady->img[r],
+                    pyramid2->img[r], pyramid2_gradx->img[r], pyramid2_grady->img[r],
+                    tc->window_width, tc->window_height, tc->step_factor,
+                    tc->max_iterations, tc->min_determinant, tc->min_displacement,
+                    tc->max_residue, tc->lighting_insensitive);
 
                 if (val == KLT_SMALL_DET || val == KLT_OOB) break;
             }
-            
-            // Update feature status (your existing code here)
-            // [Keep your existing feature status update code]
+
+            // Update feature status
+            if (val == KLT_OOB || _outOfBounds(xlocout, ylocout, ncols, nrows, tc->borderx, tc->bordery)) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_OOB;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            }
+            else if (val == KLT_SMALL_DET) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_SMALL_DET;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            }
+            else if (val == KLT_LARGE_RESIDUE) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_LARGE_RESIDUE;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            }
+            else if (val == KLT_MAX_ITERATIONS) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_MAX_ITERATIONS;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            }
+            else {
+                featurelist->feature[indx]->x = xlocout;
+                featurelist->feature[indx]->y = ylocout;
+                featurelist->feature[indx]->val = KLT_TRACKED;
+            }
         }
     }
 
-    // Memory management (same as original)
+    // Reset slots after tracking
+    _setCurrentGPUSlots(-1, -1);
+
+    // Memory management
     if (tc->sequentialMode) {
         tc->pyramid_last = pyramid2;
         tc->pyramid_last_gradx = pyramid2_gradx;
         tc->pyramid_last_grady = pyramid2_grady;
-    } else {
+    }
+    else {
         _KLTFreePyramid(pyramid2);
         _KLTFreePyramid(pyramid2_gradx);
         _KLTFreePyramid(pyramid2_grady);
@@ -2026,7 +2276,7 @@ void KLTTrackFeatures_Optimized(
     _KLTFreeFloatImage(tmpimg);
     if (floatimg1_created) _KLTFreeFloatImage(floatimg1);
     _KLTFreeFloatImage(floatimg2);
-    
+
     if (!tc->sequentialMode || !tc->pyramid_last) {
         _KLTFreePyramid(pyramid1);
         _KLTFreePyramid(pyramid1_gradx);
@@ -2035,9 +2285,27 @@ void KLTTrackFeatures_Optimized(
 
     if (KLT_verbose >= 1) {
         fprintf(stderr, "\n\t%d features successfully tracked.\n",
-                KLTCountRemainingFeatures(featurelist));
+            KLTCountRemainingFeatures(featurelist));
         fflush(stderr);
     }
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void _KLTCleanupAllCUDA(void) {
+    _KLTCleanupIntensityDiffCUDA();
+    _KLTCleanupGradientSumCUDA();
+    _KLTCleanupConvolveCUDA();
+    _KLTCleanupStreamPool();
+    _KLTCleanupGPUImageStorage();
+    _KLTCleanupPinnedMemory();
+    _KLTCleanupBatchConvolution();
 }
 
 #ifdef __cplusplus

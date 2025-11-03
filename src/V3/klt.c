@@ -136,7 +136,10 @@ KLT_TrackingContext KLTCreateTrackingContext()
 
 
 /*********************************************************************
- * KLTCreateFeatureList
+ * KLTCreate
+ * 
+ * 
+ * 
  *
  */
 

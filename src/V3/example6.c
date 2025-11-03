@@ -13,7 +13,7 @@ saved to a text file; each feature list is also written to a PPM file.
 /* #define REPLACE */
 
 #ifdef WIN32
-int RunExample3()
+int RunExample6()
 #else
 int main()
 #endif
